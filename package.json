@@ -1,6 +1,6 @@
 {
   "name": "cc-notify-telegram",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Claude Code ↔ Telegram: báo khi xong việc/bế tắc + trả lời AskUserQuestion từ Telegram khi vắng máy (Remote Ask)",
   "type": "module",
   "bin": {

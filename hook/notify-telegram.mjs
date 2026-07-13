@@ -313,6 +313,7 @@ function ensureStateDirs(home) {
   return dir;
 }
 
+// Full câu hỏi + FULL nhãn/mô tả mọi lựa chọn — KHÔNG cắt (chunkMessage lo phần dài).
 export function buildAskMessage(questions, { project, suffix, str }) {
   const tag = suffix ? `[${project} · ${suffix}]` : `[${project}]`;
   const out = [str.askHeader(tag), ''];
@@ -321,17 +322,44 @@ export function buildAskMessage(questions, { project, suffix, str }) {
     out.push(`${qi + 1}. ${q.question}${multi}`);
     (q.options || []).forEach((opt, oi) => {
       const letter = String.fromCharCode(65 + oi);
-      let desc = opt.description ? ` — ${opt.description}` : '';
-      const cps = Array.from(desc);
-      if (cps.length > 80) desc = cps.slice(0, 80).join('') + '…';
+      const desc = opt.description ? ` — ${opt.description}` : '';
       out.push(`   ${letter}. ${opt.label}${desc}`);
     });
+    out.push(''); // dòng trống ngăn cách giữa các câu cho dễ đọc
   });
-  out.push('', str.askFooter);
-  let text = out.join('\n');
-  const cps = Array.from(text);
-  if (cps.length > 4000) text = cps.slice(0, 4000).join('') + '…';
-  return text;
+  out.push(str.askFooter);
+  return out.join('\n');
+}
+
+// Telegram giới hạn 4096 ký tự/tin. Câu hỏi dài → tách theo ranh giới dòng thành nhiều tin
+// (mỗi tin ≤ limit); dòng đơn siêu dài thì hard-split theo codepoint. KHÔNG bao giờ cắt mất chữ.
+export function chunkMessage(text, limit = 4000) {
+  const chunks = [];
+  let cur = '';
+  const flush = () => {
+    if (cur) chunks.push(cur);
+    cur = '';
+  };
+  for (const line of text.split('\n')) {
+    const cps = Array.from(line);
+    const parts =
+      cps.length > limit
+        ? Array.from({ length: Math.ceil(cps.length / limit) }, (_, i) =>
+            cps.slice(i * limit, (i + 1) * limit).join('')
+          )
+        : [line];
+    for (const part of parts) {
+      const candidate = cur ? `${cur}\n${part}` : part;
+      if (Array.from(candidate).length > limit) {
+        flush();
+        cur = part;
+      } else {
+        cur = candidate;
+      }
+    }
+  }
+  flush();
+  return chunks.length ? chunks : [''];
 }
 
 export function isLocalKeyword(text) {
@@ -377,21 +405,24 @@ export function denyOutput(reason) {
 // ctx: { chatId, pending: [{messageId, sentAt(ms)}] }
 // Group: BẮT BUỘC reply đúng tin câu hỏi. Private: 1 câu chờ thì tin trần cũng tính
 // (nhưng phải MỚI hơn lúc gửi câu hỏi — chặn backlog getUpdates cũ), nhiều câu → nhắc reply.
+// Một câu hỏi có thể trải trên nhiều tin (khi bị chunk) → reply vào TIN NÀO trong nhóm cũng nhận.
+const idsOf = (p) => (Array.isArray(p.messageIds) && p.messageIds.length ? p.messageIds : [p.messageId]);
 export function classifyUpdate(update, ctx) {
   const msg = update?.message;
   if (!msg || typeof msg.text !== 'string') return { kind: 'ignore' };
   if (String(msg.chat?.id) !== String(ctx.chatId)) return { kind: 'ignore' };
-  const pendingIds = ctx.pending.map((p) => p.messageId);
+  const allIds = ctx.pending.flatMap(idsOf);
   const replyTo = msg.reply_to_message?.message_id;
   if (replyTo != null) {
-    if (!pendingIds.includes(replyTo)) return { kind: 'ignore' };
+    if (!allIds.includes(replyTo)) return { kind: 'ignore' };
     return { kind: 'reply', messageId: replyTo, text: msg.text.trim() };
   }
   if (msg.chat?.type === 'private') {
     if (ctx.pending.length === 1) {
       const freshEnough = (msg.date || 0) * 1000 >= ctx.pending[0].sentAt - 2000;
       if (!freshEnough) return { kind: 'ignore' };
-      return { kind: 'reply', messageId: ctx.pending[0].messageId, text: msg.text.trim() };
+      const ids = idsOf(ctx.pending[0]);
+      return { kind: 'reply', messageId: ids[ids.length - 1], text: msg.text.trim() };
     }
     if (ctx.pending.length > 1) return { kind: 'need-reply-hint' };
   }
@@ -504,7 +535,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Vòng chờ trả lời: poller trung tâm (giữ lock) long-poll getUpdates và phân phát
 // reply vào inbox theo message_id; session không giữ lock chỉ watch inbox của mình.
-async function waitForReply({ tg, cfg, dir, ownMessageId, deadline, env, home }) {
+async function waitForReply({ tg, cfg, dir, ownMessageIds, deadline, env, home }) {
   const lockFile = join(dir, 'poll.lock');
   let holdingLock = false;
   let lastHintAt = 0;
@@ -513,9 +544,10 @@ async function waitForReply({ tg, cfg, dir, ownMessageId, deadline, env, home })
       // remote off giữa chừng (user về máy) → nhả câu hỏi về UI local trong vài giây
       if (!loadConfig({ env, home }).remote) return { type: 'remote-off' };
 
-      // 1) inbox của mình có sẵn câu trả lời (poller khác phân phát)?
-      const inboxFile = inboxPath(dir, ownMessageId);
-      if (existsSync(inboxFile)) {
+      // 1) inbox của mình có sẵn câu trả lời (poller khác phân phát)? — reply vào bất kỳ chunk nào
+      for (const id of ownMessageIds) {
+        const inboxFile = inboxPath(dir, id);
+        if (!existsSync(inboxFile)) continue;
         let msg = null;
         try {
           msg = JSON.parse(readFileSync(inboxFile, 'utf8'));
@@ -549,7 +581,7 @@ async function waitForReply({ tg, cfg, dir, ownMessageId, deadline, env, home })
       for (const update of updates) {
         const verdict = classifyUpdate(update, { chatId: cfg.chatId, pending });
         if (verdict.kind === 'reply') {
-          if (verdict.messageId === ownMessageId) return { type: 'reply', text: verdict.text };
+          if (ownMessageIds.includes(verdict.messageId)) return { type: 'reply', text: verdict.text };
           try {
             writeFileSync(inboxPath(dir, verdict.messageId), JSON.stringify({ text: verdict.text }));
           } catch {
@@ -581,25 +613,32 @@ async function runAsk(payload, cfg, tg, env, home = homedir()) {
     str,
   });
 
-  let sent;
-  try {
-    sent = await tg.sendMessage(text);
-  } catch {
-    return null; // Telegram lỗi → UI local như thường
+  // Câu hỏi dài → nhiều tin; tin CUỐI (có footer) là "neo" nhận các cập nhật trạng thái.
+  const messageIds = [];
+  for (const chunk of chunkMessage(text)) {
+    let sent;
+    try {
+      sent = await tg.sendMessage(chunk);
+    } catch {
+      break; // lỗi giữa chừng → dùng các chunk đã gửi được
+    }
+    if (!sent?.message_id) break;
+    messageIds.push(sent.message_id);
   }
-  if (!sent?.message_id) return null;
+  if (!messageIds.length) return null; // không gửi được gì → UI local như thường
+  const anchorId = messageIds[messageIds.length - 1];
 
   const key = pendingKey(payload.session_id, questions);
   writeFileSync(
     pendingPath(dir, key),
-    JSON.stringify({ messageId: sent.message_id, sessionId: payload.session_id || '', sentAt: Date.now() })
+    JSON.stringify({ messageId: anchorId, messageIds, sessionId: payload.session_id || '', sentAt: Date.now() })
   );
 
   const deadline = Date.now() + cfg.remoteAskTimeoutSec * 1000;
-  const outcome = await waitForReply({ tg, cfg, dir, ownMessageId: sent.message_id, deadline, env, home });
+  const outcome = await waitForReply({ tg, cfg, dir, ownMessageIds: messageIds, deadline, env, home });
 
   if (outcome.type === 'reply' && !isLocalKeyword(outcome.text)) {
-    await tg.editMessageText(sent.message_id, str.answeredTg(outcome.text)).catch(() => {});
+    await tg.editMessageText(anchorId, str.answeredTg(outcome.text)).catch(() => {});
     try {
       unlinkSync(pendingPath(dir, key));
     } catch {
@@ -608,10 +647,9 @@ async function runAsk(payload, cfg, tg, env, home = homedir()) {
     return denyOutput(buildDenyReason(outcome.text, questions, str));
   }
 
-  // local / remote-off / timeout → giữ pending cho ask-done chốt sổ khi user bấm tại máy
-  const note =
-    outcome.type === 'timeout' ? str.timedOut : str.movedLocal;
-  await tg.editMessageText(sent.message_id, `${text}\n\n${note}`).catch(() => {});
+  // local / remote-off / timeout → giữ pending cho ask-done chốt sổ khi user bấm tại máy.
+  // Chỉ sửa tin neo thành ghi chú ngắn (KHÔNG nhồi lại full text — có thể vượt 4096).
+  await tg.editMessageText(anchorId, outcome.type === 'timeout' ? str.timedOut : str.movedLocal).catch(() => {});
   return null;
 }
 

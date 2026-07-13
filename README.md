@@ -157,6 +157,9 @@ Env override (ưu tiên hơn file — tiện CI): `TELEGRAM_BOT_TOKEN`, `TELEGRA
   `[tên-project · mã-session]` — reply tin nào, câu trả lời về đúng session đó (message_id là
   khoá định tuyến; bên dưới là cơ chế single-poller relay + mailbox, tự takeover khi process
   giữ poll chết).
+- **Gửi FULL nội dung, không cắt**: nhãn + mô tả mọi lựa chọn được gửi nguyên văn. Câu hỏi quá
+  dài vượt giới hạn 4096 ký tự của Telegram thì tự tách thành nhiều tin — reply vào **tin bất kỳ**
+  trong nhóm đều nhận đúng.
 - **Muốn trả lời tại máy ngay** (đang bật remote mà bạn lại ngồi ở máy): reply `local` vào tin
   câu hỏi, hoặc chạy `remote off`, hoặc chờ hết timeout. (Vì cơ chế hook của Claude Code chặn
   tuần tự nên UI tại máy chỉ hiện SAU khi hook nhả — không có kiểu 2 nơi cùng bấm được.)

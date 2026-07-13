@@ -8,6 +8,7 @@ import {
   buildAskMessage,
   buildDenyReason,
   buildStopMessage,
+  chunkMessage,
   classifyUpdate,
   denyOutput,
   extractDoneSummary,
@@ -158,12 +159,34 @@ test('buildAskMessage: tag session, đánh số câu/option, ghi chú multiSelec
   assert.match(msg, /Reply "local"/);
 });
 
-test('buildAskMessage: mô tả option dài bị cắt 80 codepoint', () => {
+test('buildAskMessage: GIỮ NGUYÊN mô tả dài, KHÔNG cắt (regression: bug cắt 80cp)', () => {
+  const longDesc = 'Đây là mô tả rất chi tiết cần đọc đầy đủ. '.repeat(10); // ~420 codepoint
   const msg = buildAskMessage(
-    [{ question: 'Q?', options: [{ label: 'X', description: 'ô'.repeat(100) }] }],
+    [{ question: 'Q?', options: [{ label: 'X', description: longDesc }] }],
     { project: 'p', suffix: '', str }
   );
-  assert.match(msg, new RegExp(`— ${'ô'.repeat(77)}…`)); // " — " chiếm 3 trong 80
+  assert.ok(msg.includes(longDesc), 'phải chứa full mô tả');
+  assert.ok(!msg.includes('…'), 'không được có dấu cắt …');
+});
+
+test('chunkMessage: gộp theo dòng, mỗi chunk ≤ limit, ghép lại nguyên văn', () => {
+  const text = Array.from({ length: 40 }, (_, i) => `dòng ${i} ${'x'.repeat(40)}`).join('\n');
+  const chunks = chunkMessage(text, 300);
+  assert.ok(chunks.length > 1);
+  for (const c of chunks) assert.ok(Array.from(c).length <= 300);
+  assert.equal(chunks.join('\n'), text);
+});
+
+test('chunkMessage: hard-split dòng đơn siêu dài (không mất ký tự)', () => {
+  const huge = 'a'.repeat(1000);
+  const chunks = chunkMessage(huge, 400);
+  assert.ok(chunks.length >= 3);
+  for (const c of chunks) assert.ok(Array.from(c).length <= 400);
+  assert.equal(chunks.join(''), huge);
+});
+
+test('chunkMessage: text ngắn → đúng 1 chunk', () => {
+  assert.deepEqual(chunkMessage('ngắn gọn', 4000), ['ngắn gọn']);
 });
 
 test('classifyUpdate: group phải reply đúng tin câu hỏi', () => {
@@ -196,6 +219,21 @@ test('classifyUpdate: private — 1 câu chờ nhận tin trần MỚI, nhiều 
     classifyUpdate({ message: { ...fresh.message, reply_to_message: { message_id: 11 } } }, two).messageId,
     11
   );
+});
+
+test('classifyUpdate: câu hỏi bị chunk (nhiều messageIds) — reply vào TIN NÀO cũng nhận', () => {
+  const ctx = { chatId: 7, pending: [{ messageId: 30, messageIds: [28, 29, 30], sentAt: Date.now() }] };
+  const base = { chat: { id: 7, type: 'supergroup' }, text: '2C', date: Math.floor(Date.now() / 1000) };
+  // reply vào chunk giữa (29) vẫn khớp
+  assert.deepEqual(classifyUpdate({ message: { ...base, reply_to_message: { message_id: 29 } } }, ctx), {
+    kind: 'reply',
+    messageId: 29,
+    text: '2C',
+  });
+  // reply vào chunk đầu (28) cũng khớp
+  assert.equal(classifyUpdate({ message: { ...base, reply_to_message: { message_id: 28 } } }, ctx).messageId, 28);
+  // id ngoài nhóm → bỏ
+  assert.equal(classifyUpdate({ message: { ...base, reply_to_message: { message_id: 99 } } }, ctx).kind, 'ignore');
 });
 
 test('resolveAnswerTokens: "1A, 2B", "A" khi 1 câu, text tự do → null', () => {
