@@ -1,0 +1,6 @@
+node_modules/
+*.log
+.DS_Store
+# KHÔNG BAO GIỜ commit token/config thật
+telegram.conf
+cc-notify-telegram.json

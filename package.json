@@ -1,0 +1,37 @@
+{
+  "name": "cc-notify-telegram",
+  "version": "0.1.0",
+  "description": "Claude Code ↔ Telegram: báo khi xong việc/bế tắc + trả lời AskUserQuestion từ Telegram khi vắng máy (Remote Ask)",
+  "type": "module",
+  "bin": {
+    "cc-notify-telegram": "bin/cli.mjs"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "hook/",
+    "snippets/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "keywords": [
+    "claude-code",
+    "claude",
+    "telegram",
+    "notification",
+    "hooks",
+    "remote-ask"
+  ],
+  "author": "dangchison",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dangchison/cc-notify-telegram.git"
+  }
+}
