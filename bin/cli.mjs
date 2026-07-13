@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // CLI cc-notify-telegram: init (mặc định) | test | status | remote on|off | uninstall
 
+import { realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 
@@ -88,7 +89,14 @@ async function main() {
   }
 }
 
-const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+// npx chạy bin qua symlink trong .bin → phải realpath trước khi so với import.meta.url,
+// không thì guard tưởng file đang bị import và CLI im lặng không làm gì.
+let isMain = false;
+try {
+  isMain = process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+} catch {
+  isMain = false;
+}
 if (isMain) {
   main()
     .then((ok) => process.exit(ok === false ? 1 : 0))
