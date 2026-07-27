@@ -30,7 +30,7 @@ const userSettings = () => ({
   },
 });
 
-test('mergeSettings: thêm đủ 4 entry, GIỮ NGUYÊN hook csm-* + key lạ', () => {
+test('mergeSettings: thêm đủ 5 entry, GIỮ NGUYÊN hook csm-* + key lạ', () => {
   const merged = mergeSettings(userSettings(), OPTS);
   assert.ok(isInstalled(merged));
   assert.equal(merged.theme, 'dark-ansi');
@@ -75,7 +75,7 @@ test('hookCommand: path luôn bọc nháy kép (chịu khoảng trắng Windows)
   );
 });
 
-test('removeOurEntries: gỡ sạch 4 entry, trả settings về nguyên trạng (kể cả legacy)', () => {
+test('removeOurEntries: gỡ sạch 5 entry, trả settings về nguyên trạng (kể cả legacy)', () => {
   const original = userSettings();
   const merged = mergeSettings(original, OPTS);
   const removed = removeOurEntries(merged);

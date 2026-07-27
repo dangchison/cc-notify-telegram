@@ -82,6 +82,49 @@ async function detectChatId(tg, ask, log) {
   }
 }
 
+// Dò Telegram user ID được phép duyệt permission — cùng khuôn với detectChatId (đọc getUpdates,
+// lấy message.from). Đây là allowlist cho Remote Permission: ai không có trong đây bấm nút cũng vô hiệu.
+async function detectUserIds(tg, ask, log) {
+  log('');
+  log('👤 Ai được duyệt permission từ Telegram? Nhắn cho bot MỘT tin bất kỳ (mention/reply');
+  log('   nếu ở group) rồi bấm Enter để dò. Hoặc gõ thẳng user ID, nhiều ID cách nhau dấu phẩy.');
+  for (;;) {
+    const answer = await ask('   Enter để dò / hoặc gõ user ID: ');
+    if (answer.trim()) {
+      return answer
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+    }
+    let updates = [];
+    try {
+      updates = await tg.getUpdates({ timeout: 0, offset: -50 });
+    } catch (err) {
+      log(`   ⚠️  getUpdates lỗi: ${err.message}`);
+      continue;
+    }
+    const users = new Map();
+    for (const u of updates) {
+      const from = u.message?.from ?? u.callback_query?.from;
+      if (from?.id != null && !from.is_bot) {
+        users.set(String(from.id), from.username ? `@${from.username}` : from.first_name || String(from.id));
+      }
+    }
+    if (!users.size) {
+      log('   Chưa thấy ai — nhắn cho bot một tin rồi Enter thử lại.');
+      continue;
+    }
+    const list = [...users.entries()];
+    list.forEach(([id, name], i) => log(`   ${i + 1}. ${name}  (${id})`));
+    const pick = await ask(`   Chọn 1-${list.length} (nhiều thì cách nhau dấu phẩy, Enter dò lại): `);
+    const picked = pick
+      .split(',')
+      .map((s) => list[Number(s.trim()) - 1]?.[0])
+      .filter(Boolean);
+    if (picked.length) return picked;
+  }
+}
+
 export async function runInit(flags, { home = homedir(), log = console.log } = {}) {
   const paths = installPaths(home);
   const interactive = !flags.yes && process.stdin.isTTY === true;
@@ -121,6 +164,31 @@ export async function runInit(flags, { home = homedir(), log = console.log } = {
     if (!chatId && interactive) chatId = await detectChatId(tgProbe, ask, log);
     if (!chatId) throw new Error('Thiếu chat ID (dùng --chat-id hoặc chạy interactive).');
 
+    // ── 1b. Remote Permission (opt-in, mặc định TẮT) ─────────────────────────
+    // Duyệt lệnh từ xa rủi ro cao hơn hẳn trả lời câu hỏi, nên phải hỏi riêng và
+    // BẮT BUỘC có allowlist — không allowlist thì hook tự im lặng (fail-closed).
+    let allowedUserIds = []
+      .concat(flags['allow-user'] ?? [])
+      .flatMap((v) => String(v).split(','))
+      .map((s) => s.trim())
+      .filter(Boolean);
+    let remotePermission = allowedUserIds.length > 0;
+    if (!allowedUserIds.length && Array.isArray(existing.allowedUserIds)) {
+      allowedUserIds = existing.allowedUserIds.map(String);
+      remotePermission = existing.remotePermission === true;
+    }
+    if (interactive && !allowedUserIds.length) {
+      log('');
+      log('🔐 Remote Permission: duyệt hộp thoại "Allow Claude to run …?" bằng nút bấm Telegram.');
+      log('   Rủi ro cao hơn Remote Ask — chỉ user ID bạn chọn mới bấm được, và không bao giờ');
+      log('   ghi permission rule vĩnh viễn vào settings.json.');
+      const answer = await ask('   Bật Remote Permission? [y/N]: ');
+      if (/^y/i.test(answer.trim())) {
+        allowedUserIds = await detectUserIds(tgProbe, ask, log);
+        remotePermission = allowedUserIds.length > 0;
+      }
+    }
+
     const config = {
       botToken,
       chatId,
@@ -129,6 +197,9 @@ export async function runInit(flags, { home = homedir(), log = console.log } = {
       ...(flags.silent || existing.silent ? { silent: true } : {}),
       ...(existing.remote ? { remote: true } : {}),
       ...(existing.remoteAskTimeoutSec ? { remoteAskTimeoutSec: existing.remoteAskTimeoutSec } : {}),
+      ...(allowedUserIds.length ? { allowedUserIds } : {}),
+      ...(remotePermission ? { remotePermission: true } : {}),
+      ...(existing.sessionAllowTtlMin ? { sessionAllowTtlMin: existing.sessionAllowTtlMin } : {}),
     };
     const configFile = writeConfig(config, home);
     log(`✅ Config → ${configFile} (chmod 600)`);
@@ -155,7 +226,9 @@ export async function runInit(flags, { home = homedir(), log = console.log } = {
     const merged = mergeSettings(settings, { nodePath, hookPath: paths.hookFile, removeLegacy });
     if (JSON.stringify(merged) !== JSON.stringify(settings)) {
       backupThenWrite(paths.settingsFile, merged);
-      log(`✅ settings.json: đăng ký 4 hook (Stop / PreToolUse / PostToolUse / Notification)${removeLegacy ? ' — đã gỡ entry bash cũ' : ''}`);
+      log(
+        `✅ settings.json: đăng ký 5 hook (Stop / PreToolUse / PostToolUse / Notification / PermissionRequest)${removeLegacy ? ' — đã gỡ entry bash cũ' : ''}`
+      );
     } else {
       log('✅ settings.json đã đúng — không cần sửa.');
     }
@@ -195,6 +268,9 @@ export async function runInit(flags, { home = homedir(), log = console.log } = {
     log('');
     log('🎉 Xong! Mở session Claude Code MỚI để CLAUDE.md được nạp.');
     log('   • Bật trả lời câu hỏi qua Telegram khi ra ngoài:  npx cc-notify-telegram remote on');
+    if (remotePermission) {
+      log('   • Bật/tắt duyệt quyền từ xa:                      npx cc-notify-telegram remote-perm on|off');
+    }
     log('   • Kiểm tra sức khoẻ:                              npx cc-notify-telegram status');
     return isInstalled(merged);
   } finally {

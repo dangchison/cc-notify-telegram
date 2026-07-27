@@ -11,10 +11,20 @@ import { runRemote } from '../src/remote.mjs';
 import { runStatus } from '../src/status.mjs';
 import { runUninstall } from '../src/uninstall.mjs';
 
-const VALUE_FLAGS = new Set(['token', 'chat-id', 'thread-id', 'lang']);
+const VALUE_FLAGS = new Set(['token', 'chat-id', 'thread-id', 'lang', 'allow-user']);
+
+// Cờ được phép lặp lại (--allow-user 1 --allow-user 2) → gom thành mảng thay vì ghi đè.
+const REPEATABLE_FLAGS = new Set(['allow-user']);
 
 export function parseArgs(argv) {
   const flags = { _: [] };
+  const set = (key, value) => {
+    if (!REPEATABLE_FLAGS.has(key) || flags[key] == null) {
+      flags[key] = value;
+      return;
+    }
+    flags[key] = [].concat(flags[key], value);
+  };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (!arg.startsWith('--')) {
@@ -23,13 +33,13 @@ export function parseArgs(argv) {
     }
     const eq = arg.indexOf('=');
     if (eq > 2) {
-      flags[arg.slice(2, eq)] = arg.slice(eq + 1);
+      set(arg.slice(2, eq), arg.slice(eq + 1));
     } else {
       const key = arg.slice(2);
       if (VALUE_FLAGS.has(key) && argv[i + 1] != null && !argv[i + 1].startsWith('--')) {
-        flags[key] = argv[++i];
+        set(key, argv[++i]);
       } else {
-        flags[key] = true;
+        set(key, true);
       }
     }
   }
@@ -44,11 +54,15 @@ Cách dùng:
   npx cc-notify-telegram status     Kiểm tra sức khoẻ toàn chuỗi notify
   npx cc-notify-telegram remote on  Bật Remote Ask (trả lời câu hỏi của Claude qua Telegram)
   npx cc-notify-telegram remote off Tắt Remote Ask (câu hỏi hiện tại máy)
+  npx cc-notify-telegram remote-perm on|off
+                                    Bật/tắt Remote Permission (duyệt hộp thoại quyền bằng
+                                    nút bấm Telegram — chỉ allowedUserIds mới bấm được)
   npx cc-notify-telegram uninstall  Gỡ hooks (--purge: xoá cả config/token + CLAUDE.md block)
 
 Cờ cho init (non-interactive):
   --token <bot-token> --chat-id <id> [--thread-id <n>] [--lang vi|en]
   [--silent] [--yes] [--no-test] [--no-claude-md] [--remove-legacy|--keep-legacy]
+  [--allow-user <telegram-user-id>]  (lặp lại được; bật luôn Remote Permission)
 `;
 
 async function main() {
@@ -81,6 +95,8 @@ async function main() {
       return runStatus({});
     case 'remote':
       return runRemote(flags._[1], {});
+    case 'remote-perm':
+      return runRemote(flags._[1], { key: 'remotePermission' });
     case 'uninstall':
       return runUninstall(flags);
     default:
