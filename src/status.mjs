@@ -78,6 +78,17 @@ export async function runStatus({ home = homedir(), log = console.log } = {}) {
   // Remote mode
   add(true, `Remote Ask: ${cfg.remote ? `ON (chờ tối đa ${cfg.remoteAskTimeoutSec}s)` : 'off'}`);
 
+  // Remote Permission — bật mà thiếu điều kiện thì hook im lặng (fail-closed), phải nói rõ.
+  if (!cfg.remotePermission) {
+    add(true, 'Remote Permission: off');
+  } else if (!cfg.allowedUserIds.length) {
+    add(false, 'Remote Permission: ON nhưng allowedUserIds RỖNG', 'không ai duyệt được — chạy lại init để thêm user ID');
+  } else if (!cfg.remote) {
+    add(false, `Remote Permission: ON (${cfg.allowedUserIds.length} user) nhưng Remote Ask đang off`, 'chạy: npx cc-notify-telegram remote on');
+  } else {
+    add(true, `Remote Permission: ON — ${cfg.allowedUserIds.length} user được duyệt, "cho phép tất cả" tối đa ${cfg.sessionAllowTtlMin}′`);
+  }
+
   let allOk = true;
   for (const r of rows) {
     log(`${r.ok ? '✓' : '✗'} ${r.label}${!r.ok && r.fix ? `\n    ↳ ${r.fix}` : ''}`);

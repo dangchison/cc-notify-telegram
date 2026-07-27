@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 // cc-notify-telegram — Claude Code hook runtime (self-contained, zero-dependency).
 //
-// Một file duy nhất được installer copy vào ~/.claude/hooks/, phục vụ 4 hook event
+// Một file duy nhất được installer copy vào ~/.claude/hooks/, phục vụ 5 hook event
 // (arg đầu tiên quyết định event):
-//   stop      Stop hook            → báo Telegram khi tin cuối chứa marker CC_NOTIFY_DONE/ESCALATE
-//   ask       PreToolUse hook      → Remote Ask: gửi AskUserQuestion qua Telegram, chờ reply
-//   ask-done  PostToolUse hook     → chốt sổ tin câu hỏi khi user trả lời tại máy
-//   notify    Notification hook    → forward "cần permission / đang chờ input" khi remote bật
+//   stop      Stop hook              → báo Telegram khi tin cuối chứa marker CC_NOTIFY_DONE/ESCALATE
+//   ask       PreToolUse hook        → Remote Ask: gửi AskUserQuestion qua Telegram, chờ reply
+//   ask-done  PostToolUse hook       → chốt sổ tin câu hỏi khi user trả lời tại máy
+//   notify    Notification hook      → forward "cần permission / đang chờ input" khi remote bật
+//   perm      PermissionRequest hook → Remote Permission: gửi yêu cầu quyền kèm nút bấm, chờ chọn
 //
 // Nguyên tắc an toàn: LUÔN exit 0, lỗi gì cũng im lặng — không bao giờ chặn Claude Code.
 // Không output gì trên stdout = hành vi mặc định (UI hiện như thường).
@@ -38,6 +39,7 @@ const POLL_LONG_SEC = 20; // long-poll getUpdates mỗi vòng
 const LOCK_STALE_MS = 60_000; // heartbeat cũ hơn ngưỡng này = poller chết → takeover
 const PENDING_TTL_MS = 24 * 60 * 60 * 1000; // dọn rác file pending/inbox mồ côi
 const MAX_ASK_TIMEOUT_SEC = 1770; // phải < timeout 1830s của hook entry trong settings
+const MAX_SESSION_ALLOW_MIN = 8 * 60; // trần "cho phép tất cả trong session" — không để mở vô hạn
 
 export function claudeDir(home = homedir()) {
   return join(home, '.claude');
@@ -54,18 +56,23 @@ export function loadConfig({ env = process.env, home = homedir() } = {}) {
   } catch {
     // chưa cài config → mọi event tự thoát im lặng
   }
-  const envRemote = env.CC_NOTIFY_REMOTE;
   const timeout = Number(file.remoteAskTimeoutSec);
+  const ttl = Number(file.sessionAllowTtlMin);
+  const onOff = (envValue, fileValue) =>
+    envValue != null ? ['1', 'true', 'on'].includes(String(envValue).toLowerCase()) : fileValue === true;
   return {
     botToken: env.TELEGRAM_BOT_TOKEN || file.botToken || '',
     chatId: env.TELEGRAM_CHAT_ID || file.chatId || '',
     threadId: env.TELEGRAM_THREAD_ID || file.threadId || undefined,
     lang: file.lang === 'en' ? 'en' : 'vi',
     silent: file.silent === true,
-    remote:
-      envRemote != null
-        ? ['1', 'true', 'on'].includes(String(envRemote).toLowerCase())
-        : file.remote === true,
+    remote: onOff(env.CC_NOTIFY_REMOTE, file.remote),
+    remotePermission: onOff(env.CC_NOTIFY_REMOTE_PERM, file.remotePermission),
+    // So sánh dạng chuỗi: config có thể ghi số hoặc chuỗi, from.id của Telegram luôn là số.
+    allowedUserIds: (Array.isArray(file.allowedUserIds) ? file.allowedUserIds : [])
+      .map((id) => String(id).trim())
+      .filter(Boolean),
+    sessionAllowTtlMin: Number.isFinite(ttl) && ttl > 0 ? Math.min(ttl, MAX_SESSION_ALLOW_MIN) : 30,
     remoteAskTimeoutSec:
       Number.isFinite(timeout) && timeout > 0 ? Math.min(timeout, MAX_ASK_TIMEOUT_SEC) : 900,
   };
@@ -99,6 +106,25 @@ const STRINGS = {
     answerPrefix: (text) => `Người dùng trả lời qua Telegram: "${text}"`,
     answerResolved: (parts) => `(Diễn giải lựa chọn: ${parts.join('; ')})`,
     notifyPrefix: '🔔',
+    permHeader: (tag) => `🔐 ${tag} Claude xin quyền dùng:`,
+    permFooter: '👇 Chọn bên dưới — chỉ tài khoản trong allowlist mới bấm được.',
+    permNoDetail: '(không có chi tiết)',
+    btnAllow: '✅ Cho phép',
+    btnDeny: '⛔ Từ chối',
+    btnAllowSession: (min) => `✅ Cho phép tất cả (${min}′)`,
+    btnLocal: '🖥 Để máy xử lý',
+    permAllowed: (who) => `✅ Đã cho phép${who}`,
+    permAllowedSession: (who, until) =>
+      `✅ Đã cho phép TẤT CẢ trong session này đến ${until}${who}`,
+    permDenied: (who) => `⛔ Đã từ chối${who}`,
+    permDenyReason: 'Người dùng đã TỪ CHỐI yêu cầu quyền này qua Telegram.',
+    permTimedOut: '⏰ Hết giờ chờ trên Telegram — yêu cầu quyền đang chờ tại máy.',
+    permMovedLocal: '🖥 Yêu cầu quyền chuyển về máy — đang chờ tại terminal…',
+    permSendFailed: '⚠️ Không gửi được đầy đủ nội dung — yêu cầu quyền chuyển về máy.',
+    permClosed: '⛔ Yêu cầu quyền đã đóng (lượt làm việc kết thúc).',
+    permNoRight: 'Bạn không có quyền duyệt yêu cầu này.',
+    planNotice: (tag) =>
+      `📋 ${tag} Claude có plan cần bạn duyệt — mở Claude Code để đọc và chọn (Accept / Revise / Reject).`,
   },
   en: {
     doneFallback: '— task completed',
@@ -119,6 +145,24 @@ const STRINGS = {
     answerPrefix: (text) => `User answered via Telegram: "${text}"`,
     answerResolved: (parts) => `(Interpreted choices: ${parts.join('; ')})`,
     notifyPrefix: '🔔',
+    permHeader: (tag) => `🔐 ${tag} Claude is requesting permission to use:`,
+    permFooter: '👇 Choose below — only allowlisted accounts can act.',
+    permNoDetail: '(no details)',
+    btnAllow: '✅ Allow',
+    btnDeny: '⛔ Deny',
+    btnAllowSession: (min) => `✅ Allow all (${min}′)`,
+    btnLocal: '🖥 Handle at the machine',
+    permAllowed: (who) => `✅ Allowed${who}`,
+    permAllowedSession: (who, until) => `✅ Allowed EVERYTHING in this session until ${until}${who}`,
+    permDenied: (who) => `⛔ Denied${who}`,
+    permDenyReason: 'The user DENIED this permission request via Telegram.',
+    permTimedOut: '⏰ Telegram wait timed out — the request is now waiting at the machine.',
+    permMovedLocal: '🖥 Permission request moved to the machine — waiting at the terminal…',
+    permSendFailed: '⚠️ Could not send the full request — falling back to the machine.',
+    permClosed: '⛔ Permission request closed (turn ended).',
+    permNoRight: 'You are not allowed to approve this request.',
+    planNotice: (tag) =>
+      `📋 ${tag} Claude has a plan to review — open Claude Code to read and choose (Accept / Revise / Reject).`,
   },
 };
 
@@ -152,10 +196,18 @@ export function makeTelegram(cfg, fetchFn = fetch) {
         ...(cfg.threadId ? { message_thread_id: Number(cfg.threadId) } : {}),
         ...extra,
       }),
+    // editMessageText KHÔNG kèm reply_markup ⇒ Telegram gỡ luôn bàn phím nút của tin đó,
+    // nên tin đã chốt không thể bị bấm lại.
     editMessageText: (messageId, text) =>
       call('editMessageText', { chat_id: cfg.chatId, message_id: messageId, text }),
+    answerCallbackQuery: (callbackQueryId, extra = {}) =>
+      call('answerCallbackQuery', { callback_query_id: callbackQueryId, ...extra }),
     getUpdates: (params) =>
-      call('getUpdates', { allowed_updates: ['message'], ...params }, ((params.timeout || 0) + 10) * 1000),
+      call(
+        'getUpdates',
+        { allowed_updates: ['message', 'callback_query'], ...params },
+        ((params.timeout || 0) + 10) * 1000
+      ),
     getMe: () => call('getMe', {}),
   };
 }
@@ -307,9 +359,11 @@ export function pendingKey(sessionId, questions) {
     .slice(0, 16);
 }
 
+const STATE_SUBDIRS = ['pending', 'inbox', 'session-allow'];
+
 function ensureStateDirs(home) {
   const dir = stateDir(home);
-  for (const sub of ['pending', 'inbox']) mkdirSync(join(dir, sub), { recursive: true });
+  for (const sub of STATE_SUBDIRS) mkdirSync(join(dir, sub), { recursive: true });
   return dir;
 }
 
@@ -408,23 +462,45 @@ export function denyOutput(reason) {
 // Một câu hỏi có thể trải trên nhiều tin (khi bị chunk) → reply vào TIN NÀO trong nhóm cũng nhận.
 const idsOf = (p) => (Array.isArray(p.messageIds) && p.messageIds.length ? p.messageIds : [p.messageId]);
 export function classifyUpdate(update, ctx) {
+  // Bấm nút inline (Remote Permission). Callback query LUÔN tới bot bất kể privacy mode,
+  // và kèm from.id không giả được → đây là kênh duy nhất kiểm tra được ai bấm.
+  const cq = update?.callback_query;
+  if (cq) {
+    if (String(cq.message?.chat?.id) !== String(ctx.chatId)) return { kind: 'ignore' };
+    const messageId = cq.message?.message_id;
+    if (messageId == null || !ctx.pending.flatMap(idsOf).includes(messageId)) return { kind: 'ignore' };
+    const action = String(cq.data || '').match(/^([adsl]):/)?.[1];
+    if (!action) return { kind: 'ignore' };
+    return {
+      kind: 'callback',
+      action,
+      messageId,
+      fromId: cq.from?.id,
+      fromName: cq.from?.first_name || cq.from?.username || '',
+      callbackId: cq.id,
+    };
+  }
+
   const msg = update?.message;
   if (!msg || typeof msg.text !== 'string') return { kind: 'ignore' };
   if (String(msg.chat?.id) !== String(ctx.chatId)) return { kind: 'ignore' };
-  const allIds = ctx.pending.flatMap(idsOf);
+  // Yêu cầu quyền CHỈ nhận qua nút bấm — text reply không bao giờ duyệt được permission,
+  // nên chúng bị loại khỏi mọi phép so khớp dưới đây.
+  const asks = ctx.pending.filter((p) => p.kind !== 'perm');
+  const allIds = asks.flatMap(idsOf);
   const replyTo = msg.reply_to_message?.message_id;
   if (replyTo != null) {
     if (!allIds.includes(replyTo)) return { kind: 'ignore' };
     return { kind: 'reply', messageId: replyTo, text: msg.text.trim() };
   }
   if (msg.chat?.type === 'private') {
-    if (ctx.pending.length === 1) {
-      const freshEnough = (msg.date || 0) * 1000 >= ctx.pending[0].sentAt - 2000;
+    if (asks.length === 1) {
+      const freshEnough = (msg.date || 0) * 1000 >= asks[0].sentAt - 2000;
       if (!freshEnough) return { kind: 'ignore' };
-      const ids = idsOf(ctx.pending[0]);
+      const ids = idsOf(asks[0]);
       return { kind: 'reply', messageId: ids[ids.length - 1], text: msg.text.trim() };
     }
-    if (ctx.pending.length > 1) return { kind: 'need-reply-hint' };
+    if (asks.length > 1) return { kind: 'need-reply-hint' };
   }
   return { kind: 'ignore' };
 }
@@ -511,9 +587,9 @@ function writeOffset(dir, offset) {
   }
 }
 
-// Dọn file pending/inbox quá hạn (session chết không kịp dọn).
+// Dọn file pending/inbox/session-allow quá hạn (session chết không kịp dọn).
 export function gcStateDir(dir, now = Date.now()) {
-  for (const sub of ['pending', 'inbox']) {
+  for (const sub of STATE_SUBDIRS) {
     let files = [];
     try {
       files = readdirSync(join(dir, sub));
@@ -534,17 +610,20 @@ export function gcStateDir(dir, now = Date.now()) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Vòng chờ trả lời: poller trung tâm (giữ lock) long-poll getUpdates và phân phát
-// reply vào inbox theo message_id; session không giữ lock chỉ watch inbox của mình.
-async function waitForReply({ tg, cfg, dir, ownMessageIds, deadline, env, home }) {
+// reply/bấm nút vào inbox theo message_id; session không giữ lock chỉ watch inbox của mình.
+// mode 'ask' = chờ text reply; mode 'perm' = chờ bấm nút inline.
+async function waitForReply({ tg, cfg, dir, ownMessageIds, deadline, env, home, mode = 'ask' }) {
   const lockFile = join(dir, 'poll.lock');
   let holdingLock = false;
   let lastHintAt = 0;
   try {
     while (Date.now() < deadline) {
-      // remote off giữa chừng (user về máy) → nhả câu hỏi về UI local trong vài giây
-      if (!loadConfig({ env, home }).remote) return { type: 'remote-off' };
+      // Tắt cờ giữa chừng (user về máy) → nhả về UI local trong vài giây.
+      // Đọc lại config MỖI vòng nên `remote off` / `remote-perm off` có hiệu lực ngay.
+      const live = loadConfig({ env, home });
+      if (!live.remote || (mode === 'perm' && !live.remotePermission)) return { type: 'remote-off' };
 
-      // 1) inbox của mình có sẵn câu trả lời (poller khác phân phát)? — reply vào bất kỳ chunk nào
+      // 1) inbox của mình có sẵn kết quả (poller khác phân phát)? — vào bất kỳ chunk nào
       for (const id of ownMessageIds) {
         const inboxFile = inboxPath(dir, id);
         if (!existsSync(inboxFile)) continue;
@@ -555,6 +634,7 @@ async function waitForReply({ tg, cfg, dir, ownMessageIds, deadline, env, home }
         } catch {
           // đọc dở → vòng sau
         }
+        if (msg?.action) return { type: 'callback', action: msg.action, fromName: msg.fromName || '' };
         if (msg?.text != null) return { type: 'reply', text: msg.text };
       }
 
@@ -580,7 +660,28 @@ async function waitForReply({ tg, cfg, dir, ownMessageIds, deadline, env, home }
       const pending = listPending(dir);
       for (const update of updates) {
         const verdict = classifyUpdate(update, { chatId: cfg.chatId, pending });
-        if (verdict.kind === 'reply') {
+        if (verdict.kind === 'callback') {
+          // Ai bấm cũng tới được bot → allowlist là hàng rào duy nhất. Kiểm ở đây (chứ không
+          // trong classifyUpdate) để còn báo ngược cho người bấm biết vì sao không ăn.
+          if (!live.allowedUserIds.includes(String(verdict.fromId))) {
+            await tg
+              .answerCallbackQuery(verdict.callbackId, { text: strings(cfg).permNoRight, show_alert: true })
+              .catch(() => {});
+            continue;
+          }
+          await tg.answerCallbackQuery(verdict.callbackId, {}).catch(() => {}); // tắt spinner
+          if (ownMessageIds.includes(verdict.messageId)) {
+            return { type: 'callback', action: verdict.action, fromName: verdict.fromName };
+          }
+          try {
+            writeFileSync(
+              inboxPath(dir, verdict.messageId),
+              JSON.stringify({ action: verdict.action, fromName: verdict.fromName })
+            );
+          } catch {
+            // session kia sẽ timeout → chấp nhận
+          }
+        } else if (verdict.kind === 'reply') {
           if (ownMessageIds.includes(verdict.messageId)) return { type: 'reply', text: verdict.text };
           try {
             writeFileSync(inboxPath(dir, verdict.messageId), JSON.stringify({ text: verdict.text }));
@@ -589,7 +690,8 @@ async function waitForReply({ tg, cfg, dir, ownMessageIds, deadline, env, home }
           }
         } else if (verdict.kind === 'need-reply-hint' && Date.now() - lastHintAt > 60_000) {
           lastHintAt = Date.now();
-          await tg.sendMessage(strings(cfg).replyHint(pending.length)).catch(() => {});
+          const askCount = pending.filter((p) => p.kind !== 'perm').length;
+          await tg.sendMessage(strings(cfg).replyHint(askCount)).catch(() => {});
         }
       }
     }
@@ -705,18 +807,264 @@ async function sweepSessionPending(sessionId, cfg, tg, home = homedir()) {
     } catch {
       continue; // process khác vừa xử lý
     }
-    await tg.editMessageText(p.messageId, strings(cfg).closedUnanswered).catch(() => {});
+    const str = strings(cfg);
+    await tg.editMessageText(p.messageId, p.kind === 'perm' ? str.permClosed : str.closedUnanswered).catch(() => {});
   }
+}
+
+// ---------------------------------------------------------------------------
+// EVENT perm — Remote Permission: duyệt hộp thoại quyền bằng nút bấm Telegram
+// ---------------------------------------------------------------------------
+//
+// PermissionRequest hook CHỈ bắn khi hộp thoại quyền sắp hiện (tool đã được allow-rule
+// duyệt sẵn thì không bắn) ⇒ không cần lọc gì thêm để tránh spam.
+//
+// Schema (đã đối chiếu zod trong binary Claude Code 2.1.149):
+//   in : { session_id, transcript_path, cwd, permission_mode?, hook_event_name,
+//          tool_name, tool_input, permission_suggestions? }
+//   out: { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision:
+//            { behavior:'allow', updatedInput?, updatedPermissions? }
+//          | { behavior:'deny', message?, interrupt? } } }
+// Không in gì = im lặng KHÔNG phải đồng ý — hộp thoại vẫn hiện tại máy.
+
+export function permOutput(behavior, { message } = {}) {
+  const decision =
+    behavior === 'deny' ? { behavior: 'deny', ...(message ? { message } : {}) } : { behavior: 'allow' };
+  return JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision } });
+}
+
+const capText = (value, max) => {
+  const cps = Array.from(String(value));
+  return cps.length > max ? cps.slice(0, max).join('') + '…' : cps.join('');
+};
+
+// Render ĐÚNG thứ đang được xin quyền. Duyệt mù là rủi ro lớn nhất của tính năng này,
+// nên nội dung gửi đi phải là nguyên văn (chỉ cap những field có thể dài vô hạn).
+export function describePermission(toolName, toolInput) {
+  const t = toolInput && typeof toolInput === 'object' ? toolInput : {};
+  const fenced = (value, max = 1500) => ['```', capText(value, max), '```'];
+  const out = [];
+
+  if (toolName === 'Bash' || toolName === 'PowerShell') {
+    if (t.description) out.push(String(t.description));
+    if (t.command) out.push(...fenced(t.command, 3000));
+  } else if (toolName === 'Edit' || toolName === 'Write' || toolName === 'NotebookEdit') {
+    if (t.file_path) out.push(String(t.file_path));
+    const body = t.new_string ?? t.content ?? t.new_source;
+    if (body != null) out.push(...fenced(body));
+  } else if (toolName === 'WebFetch') {
+    if (t.url) out.push(String(t.url));
+    if (t.prompt) out.push(capText(t.prompt, 400));
+  } else if (toolName === 'WebSearch') {
+    if (t.query) out.push(String(t.query));
+  } else if (Object.keys(t).length) {
+    try {
+      out.push(...fenced(JSON.stringify(t, null, 2), 2000));
+    } catch {
+      out.push(...fenced(String(t)));
+    }
+  }
+  return out.filter((line) => line !== '' && line != null).join('\n');
+}
+
+export function buildPermMessage({ toolName, toolInput, project, suffix, str }) {
+  const tag = suffix ? `[${project} · ${suffix}]` : `[${project}]`;
+  const detail = describePermission(toolName, toolInput);
+  return [str.permHeader(tag), '', `🔧 ${toolName}`, detail || str.permNoDetail, '', str.permFooter].join('\n');
+}
+
+// callback_data giới hạn 64 byte của Telegram → prefix 1 ký tự + key 16 hex = 18 byte.
+export function permKeyboard(key, str, ttlMin) {
+  return {
+    inline_keyboard: [
+      [
+        { text: str.btnAllow, callback_data: `a:${key}` },
+        { text: str.btnDeny, callback_data: `d:${key}` },
+      ],
+      [
+        { text: str.btnAllowSession(ttlMin), callback_data: `s:${key}` },
+        { text: str.btnLocal, callback_data: `l:${key}` },
+      ],
+    ],
+  };
+}
+
+function sessionAllowPath(dir, sessionId) {
+  const safe = createHash('sha1').update(String(sessionId || '')).digest('hex').slice(0, 16);
+  return join(dir, 'session-allow', `${safe}.json`);
+}
+
+// "Cho phép tất cả trong session này" — CÓ HẠN (trần MAX_SESSION_ALLOW_MIN), không bao giờ
+// ghi permission rule ra settings.json: hết hạn là tự hỏi lại.
+export function writeSessionAllow(dir, sessionId, ttlMin, now = Date.now()) {
+  const expiresAt = now + Math.max(1, Number(ttlMin) || 30) * 60_000;
+  writeFileSync(sessionAllowPath(dir, sessionId), JSON.stringify({ sessionId, expiresAt }));
+  return expiresAt;
+}
+
+export function readSessionAllow(dir, sessionId, now = Date.now()) {
+  try {
+    const { expiresAt } = JSON.parse(readFileSync(sessionAllowPath(dir, sessionId), 'utf8'));
+    return expiresAt > now ? expiresAt : 0;
+  } catch {
+    return 0;
+  }
+}
+
+const hhmm = (ts) => new Date(ts).toTimeString().slice(0, 5);
+
+// Tool KHÔNG hợp với nút Allow/Deny: lựa chọn thật cần đọc kỹ tại máy (Accept/Revise/Reject…),
+// và tool_input thường không chứa nội dung để duyệt. Ở chế độ thường ExitPlanMode đi kênh
+// riêng (requiresUserInteraction) nên KHÔNG tới hook này; giữ đây làm lớp phòng thủ cho các
+// chế độ mà nó lọt qua — khi đó chỉ BÁO "có plan", không dựng nút.
+const NOTIFY_ONLY_TOOLS = new Set(['ExitPlanMode']);
+
+// Tin báo gọn cho tool notify-only (không nút, nhả về máy để duyệt).
+export function buildPlanNotice({ project, suffix, str }) {
+  const tag = suffix ? `[${project} · ${suffix}]` : `[${project}]`;
+  return str.planNotice(tag);
+}
+
+async function runPerm(payload, cfg, tg, env, home = homedir()) {
+  if (!cfg.remote || !cfg.remotePermission) return null;
+  // FAIL-CLOSED: không khai báo ai được duyệt thì không hỏi từ xa, hộp thoại về máy.
+  if (!cfg.allowedUserIds.length) return null;
+  const toolName = payload.tool_name;
+  if (!toolName) return null;
+  // AskUserQuestion đã có Remote Ask (PreToolUse) lo — không bao giờ đưa vào luồng nút bấm.
+  if (toolName === 'AskUserQuestion') return null;
+
+  const str = strings(cfg);
+
+  // Plan (và tool notify-only khác): chỉ gửi 1 tin BÁO rồi nhả về máy — KHÔNG nút, KHÔNG pending,
+  // KHÔNG đụng session-allow (đặt trước readSessionAllow để "cho phép tất cả" không nuốt plan).
+  if (NOTIFY_ONLY_TOOLS.has(toolName)) {
+    await tg
+      .sendMessage(
+        buildPlanNotice({ project: projectName(payload, env), suffix: String(payload.session_id || '').slice(-4), str })
+      )
+      .catch(() => {});
+    return null;
+  }
+
+  const dir = ensureStateDirs(home);
+  gcStateDir(dir);
+
+  // Đã bấm "cho phép tất cả" và còn hạn → duyệt thẳng, KHÔNG gửi tin (đây là cơ chế chống spam).
+  if (readSessionAllow(dir, payload.session_id)) return permOutput('allow');
+
+  const key = pendingKey(payload.session_id, [{ question: `${toolName}:${JSON.stringify(payload.tool_input ?? null)}` }]);
+  const chunks = chunkMessage(
+    buildPermMessage({
+      toolName,
+      toolInput: payload.tool_input,
+      project: projectName(payload, env),
+      suffix: String(payload.session_id || '').slice(-4),
+      str,
+    })
+  );
+
+  // Bàn phím nút gắn vào tin CUỐI. Gửi thiếu dù chỉ 1 chunk là nhả về máy: duyệt khi mới
+  // thấy một PHẦN của lệnh nguy hiểm hơn nhiều so với việc phải ra máy bấm.
+  const messageIds = [];
+  let sendFailed = false;
+  for (let i = 0; i < chunks.length; i++) {
+    const isAnchor = i === chunks.length - 1;
+    try {
+      const sent = await tg.sendMessage(
+        chunks[i],
+        isAnchor ? { reply_markup: permKeyboard(key, str, cfg.sessionAllowTtlMin) } : {}
+      );
+      if (!sent?.message_id) throw new Error('no message_id');
+      messageIds.push(sent.message_id);
+    } catch {
+      sendFailed = true;
+      break;
+    }
+  }
+  if (sendFailed || !messageIds.length) {
+    if (messageIds.length) {
+      await tg.editMessageText(messageIds[messageIds.length - 1], str.permSendFailed).catch(() => {});
+    }
+    return null;
+  }
+  const anchorId = messageIds[messageIds.length - 1];
+
+  writeFileSync(
+    pendingPath(dir, key),
+    JSON.stringify({
+      kind: 'perm',
+      messageId: anchorId,
+      messageIds,
+      sessionId: payload.session_id || '',
+      toolName,
+      sentAt: Date.now(),
+    })
+  );
+
+  const outcome = await waitForReply({
+    tg,
+    cfg,
+    dir,
+    ownMessageIds: messageIds,
+    deadline: Date.now() + cfg.remoteAskTimeoutSec * 1000,
+    env,
+    home,
+    mode: 'perm',
+  });
+
+  try {
+    unlinkSync(pendingPath(dir, key));
+  } catch {
+    // đã bị GC/sweep
+  }
+
+  if (outcome.type === 'callback' && outcome.action !== 'l') {
+    const who = outcome.fromName ? ` (${outcome.fromName})` : '';
+    if (outcome.action === 'd') {
+      await tg.editMessageText(anchorId, str.permDenied(who)).catch(() => {});
+      return permOutput('deny', { message: str.permDenyReason });
+    }
+    if (outcome.action === 's') {
+      const until = writeSessionAllow(dir, payload.session_id, cfg.sessionAllowTtlMin);
+      await tg.editMessageText(anchorId, str.permAllowedSession(who, hhmm(until))).catch(() => {});
+    } else {
+      await tg.editMessageText(anchorId, str.permAllowed(who)).catch(() => {});
+    }
+    return permOutput('allow');
+  }
+
+  // 'l' (để máy xử lý) / remote-off / timeout → im lặng ⇒ hộp thoại hiện tại máy.
+  await tg
+    .editMessageText(anchorId, outcome.type === 'timeout' ? str.permTimedOut : str.permMovedLocal)
+    .catch(() => {});
+  return null;
 }
 
 // ---------------------------------------------------------------------------
 // EVENT notify — forward Notification (permission / idle) khi remote bật
 // ---------------------------------------------------------------------------
 
+// Message của Notification kiểu "cần duyệt plan" (nhận diện để KHÔNG lọc nhầm khi chống trùng).
+const PLAN_MESSAGE_RE = /\bplan\b/i;
+
+// Quyết định có bỏ qua một Notification để tránh TRÙNG với tin do PermissionRequest hook gửi.
+// Khi remote-perm bật, mọi hộp thoại xin-quyền (Bash/Edit…) đã được hook `perm` gửi kèm nút →
+// tin `permission_prompt` của Notification chỉ là bản sao nghèo hơn ⇒ bỏ. NHƯNG chừa plan:
+// ExitPlanMode KHÔNG qua hook `perm`, nên tin plan phải được giữ (2 lớp: message chứa "plan").
+export function shouldSkipNotification(notificationType, message, cfg) {
+  return (
+    cfg.remotePermission === true &&
+    notificationType === 'permission_prompt' &&
+    !PLAN_MESSAGE_RE.test(String(message || ''))
+  );
+}
+
 async function runNotify(payload, cfg, tg, env) {
   if (!cfg.remote) return;
   const message = payload.message;
   if (!message || typeof message !== 'string') return;
+  if (shouldSkipNotification(payload.notification_type, message, cfg)) return;
   await tg.sendMessage(`${strings(cfg).notifyPrefix} [${projectName(payload, env)}] ${message}`);
 }
 
@@ -753,6 +1101,7 @@ async function main() {
   if (event === 'ask') return runAsk(payload, cfg, tg, process.env);
   if (event === 'ask-done') return runAskDone(payload, cfg, tg).then(() => null);
   if (event === 'notify') return runNotify(payload, cfg, tg, process.env).then(() => null);
+  if (event === 'perm') return runPerm(payload, cfg, tg, process.env);
   return null;
 }
 

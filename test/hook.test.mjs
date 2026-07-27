@@ -7,10 +7,13 @@ import { join } from 'node:path';
 import {
   buildAskMessage,
   buildDenyReason,
+  buildPermMessage,
+  buildPlanNotice,
   buildStopMessage,
   chunkMessage,
   classifyUpdate,
   denyOutput,
+  describePermission,
   extractDoneSummary,
   extractLocalAnswers,
   fallbackBody,
@@ -20,10 +23,15 @@ import {
   lastAssistantText,
   loadConfig,
   pendingKey,
+  permKeyboard,
+  permOutput,
+  readSessionAllow,
   resolveAnswerTokens,
+  shouldSkipNotification,
   strings,
   summaryToBullets,
   tryAcquireLock,
+  writeSessionAllow,
 } from '../hook/notify-telegram.mjs';
 
 const str = strings({ lang: 'vi' });
@@ -342,4 +350,186 @@ test('loadConfig: đọc file, env override, clamp remoteAskTimeoutSec dưới t
   const empty = loadConfig({ home: mkdtempSync(join(tmpdir(), 'ccnt-e-')), env: {} });
   assert.equal(empty.botToken, '');
   assert.equal(empty.remoteAskTimeoutSec, 900);
+});
+
+// ---------------------------------------------------------------------------
+// event perm — Remote Permission
+// ---------------------------------------------------------------------------
+
+test('describePermission: Bash gửi NGUYÊN VĂN description + command', () => {
+  const out = describePermission('Bash', { description: 'Read ops block', command: 'grep -n "X" a.js | head -1' });
+  assert.equal(out, 'Read ops block\n```\ngrep -n "X" a.js | head -1\n```');
+});
+
+test('describePermission: Edit/Write lấy file_path + nội dung mới; tool lạ → JSON', () => {
+  assert.match(describePermission('Write', { file_path: '/tmp/a.txt', content: 'hello' }), /^\/tmp\/a\.txt\n```\nhello\n```$/);
+  assert.match(describePermission('Edit', { file_path: '/tmp/b.txt', new_string: 'xyz' }), /\/tmp\/b\.txt[\s\S]*xyz/);
+  assert.match(describePermission('mcp__foo__bar', { baz: 1 }), /"baz": 1/);
+  assert.equal(describePermission('Whatever', {}), '');
+  assert.equal(describePermission('Whatever', null), '');
+});
+
+test('describePermission: command siêu dài bị cap (không làm vỡ giới hạn Telegram)', () => {
+  const out = describePermission('Bash', { command: 'x'.repeat(5000) });
+  assert.ok(Array.from(out).length < 3100, `dài quá: ${Array.from(out).length}`);
+  assert.ok(out.endsWith('…\n```'));
+});
+
+test('buildPermMessage: tag project·session, tên tool, footer; rỗng → permNoDetail', () => {
+  const msg = buildPermMessage({ toolName: 'Bash', toolInput: { command: 'ls -la' }, project: 'proj', suffix: 'a1b2', str });
+  assert.match(msg, /^🔐 \[proj · a1b2\] Claude xin quyền dùng:/);
+  assert.match(msg, /🔧 Bash/);
+  assert.match(msg, /ls -la/);
+  assert.ok(msg.endsWith(str.permFooter));
+
+  const bare = buildPermMessage({ toolName: 'Weird', toolInput: {}, project: 'p', suffix: '', str });
+  assert.match(bare, /^🔐 \[p\]/);
+  assert.match(bare, /\(không có chi tiết\)/);
+});
+
+test('permKeyboard: 4 nút, callback_data đúng prefix và KHÔNG vượt 64 byte của Telegram', () => {
+  const kb = permKeyboard(pendingKey('sess-1', [{ question: 'q' }]), str, 30);
+  const buttons = kb.inline_keyboard.flat();
+  assert.equal(buttons.length, 4);
+  assert.deepEqual(buttons.map((b) => b.callback_data.split(':')[0]), ['a', 'd', 's', 'l']);
+  for (const b of buttons) {
+    assert.ok(Buffer.byteLength(b.callback_data, 'utf8') <= 64, `callback_data quá dài: ${b.callback_data}`);
+  }
+  assert.match(buttons[2].text, /30′/);
+});
+
+test('permOutput: đúng schema PermissionRequest (allow / deny kèm message)', () => {
+  assert.deepEqual(JSON.parse(permOutput('allow')), {
+    hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } },
+  });
+  assert.deepEqual(JSON.parse(permOutput('deny', { message: 'nope' })), {
+    hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny', message: 'nope' } },
+  });
+  // deny không message → không có key thừa
+  assert.deepEqual(JSON.parse(permOutput('deny')).hookSpecificOutput.decision, { behavior: 'deny' });
+});
+
+const callbackUpdate = (over = {}) => ({
+  callback_query: {
+    id: 'cb1',
+    data: 'a:KEY1',
+    from: { id: 777, first_name: 'Son' },
+    message: { message_id: 10, chat: { id: -100 } },
+    ...over,
+  },
+});
+
+test('classifyUpdate: bấm nút hợp lệ → callback kèm fromId (để kiểm allowlist)', () => {
+  const ctx = { chatId: '-100', pending: [{ kind: 'perm', messageId: 10, sentAt: 1 }] };
+  assert.deepEqual(classifyUpdate(callbackUpdate(), ctx), {
+    kind: 'callback',
+    action: 'a',
+    messageId: 10,
+    fromId: 777,
+    fromName: 'Son',
+    callbackId: 'cb1',
+  });
+});
+
+test('classifyUpdate: bấm nút sai chat / tin lạ / data lạ → ignore', () => {
+  const ctx = { chatId: '-100', pending: [{ kind: 'perm', messageId: 10, sentAt: 1 }] };
+  const sameShape = (over) => classifyUpdate(callbackUpdate(over), ctx).kind;
+  assert.equal(sameShape({ message: { message_id: 10, chat: { id: -999 } } }), 'ignore');
+  assert.equal(sameShape({ message: { message_id: 11, chat: { id: -100 } } }), 'ignore');
+  assert.equal(sameShape({ data: 'zzz' }), 'ignore');
+  assert.equal(sameShape({ data: '' }), 'ignore');
+});
+
+test('classifyUpdate: text reply KHÔNG bao giờ duyệt được pending kind=perm', () => {
+  const ctx = { chatId: '-100', pending: [{ kind: 'perm', messageId: 10, sentAt: 1 }] };
+  const reply = { message: { text: 'y', chat: { id: -100, type: 'group' }, reply_to_message: { message_id: 10 } } };
+  assert.equal(classifyUpdate(reply, ctx).kind, 'ignore');
+  // private chat 1 pending perm → tin trần cũng không tính là trả lời
+  const bare = { message: { text: 'y', date: 9999999999, chat: { id: -100, type: 'private' } } };
+  assert.equal(classifyUpdate(bare, ctx).kind, 'ignore');
+});
+
+test('session-allow: còn hạn trả expiresAt, hết hạn / chưa có trả 0', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ccnt-sa-'));
+  mkdirSync(join(dir, 'session-allow'), { recursive: true });
+  const now = 1_000_000;
+  assert.equal(readSessionAllow(dir, 'sess-A', now), 0);
+
+  const expiresAt = writeSessionAllow(dir, 'sess-A', 30, now);
+  assert.equal(expiresAt, now + 30 * 60_000);
+  assert.equal(readSessionAllow(dir, 'sess-A', now + 60_000), expiresAt);
+  assert.equal(readSessionAllow(dir, 'sess-A', expiresAt + 1), 0);
+  // session khác không ăn ké
+  assert.equal(readSessionAllow(dir, 'sess-B', now), 0);
+});
+
+test('gcStateDir: dọn cả session-allow quá 24h', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ccnt-gc2-'));
+  mkdirSync(join(dir, 'session-allow'), { recursive: true });
+  const stale = join(dir, 'session-allow', 'old.json');
+  writeFileSync(stale, '{}');
+  const longAgo = new Date(Date.now() - 48 * 3600 * 1000);
+  utimesSync(stale, longAgo, longAgo);
+  gcStateDir(dir);
+  assert.ok(!existsSync(stale));
+});
+
+test('loadConfig: remotePermission / allowedUserIds (ép chuỗi) / sessionAllowTtlMin clamp', () => {
+  const home = mkdtempSync(join(tmpdir(), 'ccnt-perm-'));
+  mkdirSync(join(home, '.claude'), { recursive: true });
+  writeFileSync(
+    join(home, '.claude', 'cc-notify-telegram.json'),
+    JSON.stringify({
+      botToken: 'T',
+      chatId: '-1',
+      remotePermission: true,
+      allowedUserIds: [777, ' 888 ', ''],
+      sessionAllowTtlMin: 99999,
+    })
+  );
+  const cfg = loadConfig({ home, env: {} });
+  assert.equal(cfg.remotePermission, true);
+  assert.deepEqual(cfg.allowedUserIds, ['777', '888']); // so khớp with String(from.id)
+  assert.equal(cfg.sessionAllowTtlMin, 8 * 60);
+
+  assert.equal(loadConfig({ home, env: { CC_NOTIFY_REMOTE_PERM: 'off' } }).remotePermission, false);
+  assert.equal(loadConfig({ home, env: { CC_NOTIFY_REMOTE_PERM: '1' } }).remotePermission, true);
+
+  // mặc định: TẮT và không ai được duyệt (fail-closed)
+  const bare = loadConfig({ home: mkdtempSync(join(tmpdir(), 'ccnt-p2-')), env: {} });
+  assert.equal(bare.remotePermission, false);
+  assert.deepEqual(bare.allowedUserIds, []);
+  assert.equal(bare.sessionAllowTtlMin, 30);
+});
+
+// ---------------------------------------------------------------------------
+// event perm — plan notify-only + chống trùng Notification
+// ---------------------------------------------------------------------------
+
+test('buildPlanNotice: tag project·session, có 📋 + wording Accept/Revise/Reject', () => {
+  const msg = buildPlanNotice({ project: 'proj', suffix: 'a1b2', str });
+  assert.match(msg, /^📋 \[proj · a1b2\]/);
+  assert.match(msg, /Accept \/ Revise \/ Reject/);
+  // không suffix → tag chỉ có project
+  assert.match(buildPlanNotice({ project: 'p', suffix: '', str }), /^📋 \[p\]/);
+});
+
+test('permOutput deny: kèm message lý do đúng schema { behavior:"deny", message }', () => {
+  const denied = JSON.parse(permOutput('deny', { message: str.permDenyReason }));
+  assert.equal(denied.hookSpecificOutput.decision.behavior, 'deny');
+  assert.equal(denied.hookSpecificOutput.decision.message, str.permDenyReason);
+});
+
+test('shouldSkipNotification: bỏ permission_prompt khi remote-perm ON, nhưng CHỪA plan', () => {
+  const on = { remotePermission: true };
+  const off = { remotePermission: false };
+  // Bash permission (remote-perm on) → bỏ để khỏi trùng nút bấm
+  assert.equal(shouldSkipNotification('permission_prompt', 'Claude needs permission to run npm test', on), true);
+  // Plan → GIỮ dù type permission_prompt (2 lớp: message chứa "plan")
+  assert.equal(shouldSkipNotification('permission_prompt', 'Plan ready for review', on), false);
+  // remote-perm OFF → giữ nguyên hành vi cũ, không bỏ gì
+  assert.equal(shouldSkipNotification('permission_prompt', 'needs permission', off), false);
+  // type khác permission_prompt (idle/agent chờ input) → luôn giữ
+  assert.equal(shouldSkipNotification('idle_prompt', 'waiting for input', on), false);
+  assert.equal(shouldSkipNotification('agent_needs_input', 'Plan ready for review', on), false);
 });
