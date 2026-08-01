@@ -111,6 +111,39 @@ test('runRemote: global command không có providerThreads thì gửi một tin 
   assert.doesNotMatch(calls[0].text, /cho claude|cho codex|cho antigravity/);
 });
 
+test('runRemote: retry lỗi fetch failed tạm thời khi gửi status theo topic', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'ccnt-topic-route-retry-'));
+  writeConfig(
+    {
+      botToken: 'T',
+      chatId: '-100',
+      enabledProviders: ['claude'],
+      providerThreads: { claude: 5 },
+      remote: false,
+    },
+    home
+  );
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    calls.push(JSON.parse(init.body));
+    if (calls.length === 1) {
+      const err = new TypeError('fetch failed');
+      err.cause = { code: 'UND_ERR_CONNECT_TIMEOUT' };
+      throw err;
+    }
+    return { json: async () => ({ ok: true, result: { message_id: calls.length } }) };
+  };
+  try {
+    assert.equal(await runRemote('on', { home, log: () => {}, cwd: '/repo/app' }), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map((body) => body.message_thread_id), [5, 5]);
+});
+
 test('parseArgs: giữ provider positional cho remote command', () => {
   const flags = parseArgs(['remote-perm', 'on', 'antigravity']);
   assert.deepEqual(flags._, ['remote-perm', 'on', 'antigravity']);
