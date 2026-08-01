@@ -2,6 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  appServerApprovalResponse,
+  appServerApprovalToPermissionPayload,
   appServerQuestionsToAsk,
   handleServerRequest,
   patchInitializeRequest,
@@ -99,4 +101,96 @@ test('handleServerRequest answers app-server ASK requests from Telegram reply to
   assert.deepEqual(result, { id: 42, result: { answers: ['React', 'VPS'] } });
   assert.equal(edits[0].id, 99);
   assert.match(edits[0].text, /Đã trả lời qua Telegram/);
+});
+
+test('appServerApprovalToPermissionPayload maps command approvals to permission prompt detail', () => {
+  const mapped = appServerApprovalToPermissionPayload({
+    method: 'item/commandExecution/requestApproval',
+    params: {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      itemId: 'item-1',
+      command: 'git status',
+      cwd: '/repo',
+      reason: 'needs shell',
+    },
+  });
+
+  assert.equal(mapped.sessionId, 'thread-1');
+  assert.equal(mapped.toolName, 'Command');
+  assert.equal(mapped.toolInput.command, 'git status');
+  assert.equal(mapped.toolInput.cwd, '/repo');
+});
+
+test('appServerApprovalResponse maps Telegram button actions to app-server decisions', () => {
+  assert.deepEqual(appServerApprovalResponse('item/commandExecution/requestApproval', 'a'), { decision: 'accept' });
+  assert.deepEqual(appServerApprovalResponse('item/commandExecution/requestApproval', 's'), {
+    decision: 'acceptForSession',
+  });
+  assert.deepEqual(appServerApprovalResponse('item/fileChange/requestApproval', 'd'), { decision: 'decline' });
+  assert.deepEqual(
+    appServerApprovalResponse('item/permissions/requestApproval', 's', {
+      permissions: { network: { enabled: true }, fileSystem: null },
+    }),
+    { permissions: { network: { enabled: true } }, scope: 'session' }
+  );
+  assert.deepEqual(appServerApprovalResponse('execCommandApproval', 'd'), {
+    decision: { denied: { rejection: 'Người dùng đã TỪ CHỐI yêu cầu quyền này qua Telegram.' } },
+  });
+});
+
+test('handleServerRequest answers app-server command approval from Telegram allow button', async () => {
+  const edits = [];
+  const result = await handleServerRequest(
+    {
+      method: 'item/commandExecution/requestApproval',
+      id: 43,
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        itemId: 'item-1',
+        command: 'pnpm test',
+        cwd: '/repo',
+        reason: null,
+      },
+    },
+    {
+      cfg: { lang: 'vi', providerId: 'codex', remoteAskTimeoutSec: 900, sessionAllowTtlMin: 30 },
+      tg: {
+        editMessageText: async (id, text) => edits.push({ id, text }),
+      },
+      promptPerm: async () => ({
+        type: 'ok',
+        outcome: { type: 'callback', action: 'a', fromName: 'Ren' },
+        anchorId: 100,
+        dir: '/tmp',
+      }),
+    }
+  );
+
+  assert.deepEqual(result, { id: 43, result: { decision: 'accept' } });
+  assert.equal(edits[0].id, 100);
+  assert.match(edits[0].text, /Đã cho phép/);
+});
+
+test('handleServerRequest passes approval back to local client on timeout/local', async () => {
+  const result = await handleServerRequest(
+    {
+      method: 'item/fileChange/requestApproval',
+      id: 44,
+      params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-1', reason: 'write outside cwd' },
+    },
+    {
+      cfg: { lang: 'vi', providerId: 'codex', remoteAskTimeoutSec: 900, sessionAllowTtlMin: 30 },
+      tg: { editMessageText: async () => {} },
+      promptPerm: async () => ({
+        type: 'ok',
+        outcome: { type: 'timeout' },
+        anchorId: 101,
+        dir: '/tmp',
+      }),
+    }
+  );
+
+  assert.equal(result, null);
 });
