@@ -1,8 +1,47 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import { AgentProvider, projectName } from './base-provider.mjs';
+
+const NOTIFY_MARKER = '# ai-notify-telegram notify';
+const OWNED_NOTIFY_BLOCK_RE = /^# ai-notify-telegram notify\nnotify = \[[^\n]*\]\n?/gm;
+
+function firstTableLineIndex(lines) {
+  const idx = lines.findIndex((line) => /^\s*\[/.test(line));
+  return idx === -1 ? lines.length : idx;
+}
+
+function upsertRootNotify(config, notifyLine) {
+  const withoutOwnedBlock = config.replace(OWNED_NOTIFY_BLOCK_RE, '');
+  const lines = withoutOwnedBlock.split('\n');
+  if (lines.at(-1) === '') lines.pop();
+
+  const tableIdx = firstTableLineIndex(lines);
+  const rootLines = lines.slice(0, tableIdx);
+  const tableLines = lines.slice(tableIdx);
+  const notifyIdx = rootLines.findIndex((line) => /^\s*notify\s*=/.test(line));
+  const block = [NOTIFY_MARKER, notifyLine];
+
+  if (notifyIdx >= 0) {
+    rootLines.splice(notifyIdx, 1, ...block);
+  } else {
+    if (rootLines.length && rootLines.at(-1).trim() !== '') rootLines.push('');
+    rootLines.push(...block);
+  }
+
+  if (tableLines.length && rootLines.at(-1).trim() !== '') rootLines.push('');
+  return [...rootLines, ...tableLines].join('\n').replace(/\n{3,}/g, '\n\n') + '\n';
+}
+
+function backupThenWrite(file, current, next) {
+  if (current === next) return;
+  if (existsSync(file)) {
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+    copyFileSync(file, `${file}.bak-${stamp}`);
+  }
+  writeFileSync(file, next);
+}
 
 export class CodexProvider extends AgentProvider {
   id = 'codex';
@@ -27,12 +66,8 @@ export class CodexProvider extends AgentProvider {
     const paths = this.paths(home);
     mkdirSync(paths.dir, { recursive: true });
     const current = existsSync(paths.configFile) ? readFileSync(paths.configFile, 'utf8') : '';
-    const marker = '# ai-notify-telegram notify';
-    const line = `${marker}\nnotify = ${this.notifyCommand(nodePath, hookPath)}\n`;
-    const next = current.includes(marker)
-      ? current.replace(new RegExp(`${marker}[\\s\\S]*?(?=\\n\\[[^\\n]+\\]|\\n# |\\n?$)`), line.trim())
-      : `${current}${current && !current.endsWith('\n') ? '\n' : ''}${line}`;
-    writeFileSync(paths.configFile, next.endsWith('\n') ? next : `${next}\n`);
+    const next = upsertRootNotify(current, `notify = ${this.notifyCommand(nodePath, hookPath)}`);
+    backupThenWrite(paths.configFile, current, next);
     return { success: true, updatedFiles: [paths.configFile] };
   }
 
@@ -40,8 +75,8 @@ export class CodexProvider extends AgentProvider {
     const paths = this.paths(home);
     if (!existsSync(paths.configFile)) return { success: true, removedFiles: [] };
     const current = readFileSync(paths.configFile, 'utf8');
-    const next = current.replace(/# ai-notify-telegram notify\nnotify = \[[^\n]*\]\n?/g, '');
-    writeFileSync(paths.configFile, next);
+    const next = current.replace(OWNED_NOTIFY_BLOCK_RE, '');
+    backupThenWrite(paths.configFile, current, next);
     return { success: true, removedFiles: [paths.configFile] };
   }
 

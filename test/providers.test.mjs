@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { buildAskMessage, buildPermMessage, buildStopMessage, strings } from '../hook/notify-telegram.mjs';
 import { AntigravityProvider, ClaudeProvider, CodexProvider, ProviderRegistry } from '../src/providers/index.mjs';
@@ -41,6 +44,40 @@ test('CodexProvider: normalize command approval payload và format app-server de
   assert.equal(JSON.parse(provider.formatOutput({ behavior: 'allow' }, 'perm')).decision, 'accept');
   assert.equal(JSON.parse(provider.formatOutput({ behavior: 'allow', session: true }, 'perm')).decision, 'acceptForSession');
   assert.equal(JSON.parse(provider.formatOutput({ behavior: 'deny', reason: 'no' }, 'perm')).decision, 'decline');
+});
+
+test('CodexProvider: registerHooks ghi notify ở TOML root trước các table', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'cc-notify-codex-'));
+  const codexDir = join(home, '.codex');
+  mkdirSync(codexDir, { recursive: true });
+  const configFile = join(codexDir, 'config.toml');
+  writeFileSync(configFile, 'model = "gpt-5"\n\n[tui.model_availability_nux]\n"gpt-5.6-sol" = 1\n');
+
+  const provider = new CodexProvider();
+  await provider.registerHooks({ nodePath: '/usr/bin/node', hookPath: '/tmp/hook.mjs', home });
+
+  const config = readFileSync(configFile, 'utf8');
+  const markerIndex = config.indexOf('# ai-notify-telegram notify');
+  const tableIndex = config.indexOf('[tui.model_availability_nux]');
+  assert.ok(markerIndex >= 0);
+  assert.ok(markerIndex < tableIndex);
+  assert.doesNotMatch(config.slice(tableIndex), /^notify\s*=/m);
+});
+
+test('CodexProvider: registerHooks thay notify root hiện có thay vì tạo duplicate', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'cc-notify-codex-'));
+  const codexDir = join(home, '.codex');
+  mkdirSync(codexDir, { recursive: true });
+  const configFile = join(codexDir, 'config.toml');
+  writeFileSync(configFile, 'model = "gpt-5"\nnotify = ["/old"]\n\n[plugins.demo]\nenabled = true\n');
+
+  const provider = new CodexProvider();
+  await provider.registerHooks({ nodePath: '/usr/bin/node', hookPath: '/tmp/hook.mjs', home });
+
+  const config = readFileSync(configFile, 'utf8');
+  assert.equal(config.match(/^notify\s*=/gm)?.length, 1);
+  assert.doesNotMatch(config, /"\/old"/);
+  assert.match(config, /^notify = \["\/usr\/bin\/node", "\/tmp\/hook\.mjs", "notify", "codex"\]$/m);
 });
 
 test('AntigravityProvider: normalize hook payload và format PreToolUse decisions', () => {
