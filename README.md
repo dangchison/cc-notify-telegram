@@ -90,6 +90,58 @@ npx -y github:dangchison/cc-notify-telegram init \
 
 ---
 
+## Telegram Topics cho từng Agent
+
+Nếu Telegram group bật **Topics/Forum**, bạn có thể tách tin của từng Agent vào topic riêng bằng `providerThreads`.
+
+Ví dụ:
+
+```json
+{
+  "chatId": "-1001234567890",
+  "providerThreads": {
+    "claude": 5,
+    "codex": 6,
+    "antigravity": 7
+  }
+}
+```
+
+Khi đó:
+
+- Tin từ Claude Code gửi vào topic `message_thread_id = 5`
+- Tin từ Codex gửi vào topic `message_thread_id = 6`
+- Tin từ Antigravity gửi vào topic `message_thread_id = 7`
+
+Điều kiện cần:
+
+- Group phải là supergroup có bật Topics.
+- Bot phải ở trong group và có quyền gửi tin. Nếu muốn bot tự tạo topic demo hoặc quản lý topic, cần nâng bot lên admin và bật quyền **Manage Topics**.
+- `message_thread_id` không phải `chatId`; đây là ID riêng của từng topic.
+
+Cách lấy `message_thread_id` khi đã có topic:
+
+1. Vào từng topic, mention bot một tin, ví dụ `@your_bot claude topic`.
+2. Chạy đoạn dưới để liệt kê topic ID bot vừa thấy:
+
+```bash
+node -e "import('node:fs').then(async fs=>{const p=process.env.HOME+'/.config/ai-notify-telegram/config.json';const c=JSON.parse(fs.readFileSync(p,'utf8'));const r=await fetch('https://api.telegram.org/bot'+c.botToken+'/getUpdates',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({offset:-100,timeout:0,allowed_updates:['message','callback_query']})});const j=await r.json();const out=[];for(const u of j.result||[]){const m=u.message||u.callback_query?.message;if(String(m?.chat?.id)===String(c.chatId)&&m.message_thread_id!=null)out.push({message_thread_id:m.message_thread_id,text:m.text||''});}console.log(JSON.stringify(out,null,2));})"
+```
+
+3. Ghi các ID đó vào `~/.config/ai-notify-telegram/config.json`:
+
+```json
+"providerThreads": {
+  "claude": 5,
+  "codex": 6,
+  "antigravity": 7
+}
+```
+
+Nếu topic ID sai hoặc topic bị xoá, tool sẽ thử fallback gửi về group chính để không mất thông báo.
+
+---
+
 ## Cách hoạt động
 
 **Notify khi xong việc — giao thức marker.** Block hướng dẫn trong `CLAUDE.md`, `CODEX.md`, hoặc `AGENTS.md` dặn Agent: *khi (và chỉ khi) xong hẳn toàn bộ việc*, kết thúc tin nhắn cuối bằng một HTML comment ẩn `<!-- AI_NOTIFY_DONE: ý 1 | ý 2 -->` (tương thích cả `<!-- CC_NOTIFY_DONE: ... -->`). Stop hook đọc tin cuối trong transcript/history, thấy marker thì tách tóm tắt gửi Telegram (mỗi `|` một bullet).
@@ -176,6 +228,9 @@ Env override (ưu tiên hơn file — tiện CI): `TELEGRAM_BOT_TOKEN`, `TELEGRA
 - **Fail-Closed Authorization**: `allowedUserIds` kiểm tra Telegram `from.id` (do Telegram server ký, không thể giả mạo). Rỗng = không ai duyệt được từ xa.
 - **Fail-Safe Fallback**: Mất mạng / hết hạn chờ / lỗi Telegram → tự động chuyển về giao diện máy local, không bao giờ tự động duyệt.
 - **Smart Topic Fallback**: Nếu `threadId` không hợp lệ hoặc Topic bị xóa, tin nhắn tự động fallback về chat chính của Group.
+- **`group chat was upgraded to a supergroup chat`**: Telegram đã đổi group thường thành supergroup, nên `chatId` cũ không dùng được nữa. Lỗi Telegram thường kèm `migrate_to_chat_id`; cập nhật `chatId` trong `~/.config/ai-notify-telegram/config.json` sang ID mới dạng `-100...`, rồi chạy lại `npx cc-notify-telegram test`.
+- **`The operation was aborted due to timeout` / `fetch failed`**: thường là Telegram API hoặc mạng đang chậm/chặn kết nối. Bản mới dùng timeout 30 giây và báo lỗi rõ hơn. Hãy retry, kiểm tra mạng/VPN/proxy, rồi chạy `npx cc-notify-telegram test`. Nếu dùng bản npm/cache cũ, chạy từ GitHub repo mới nhất: `npx -y github:dangchison/cc-notify-telegram test`.
+- **Tin không vào đúng topic**: kiểm tra `providerThreads` có đúng provider key (`claude`, `codex`, `antigravity`) và đúng `message_thread_id`. `threadId` là topic mặc định; `providerThreads.<provider>` sẽ ưu tiên hơn `threadId`.
 
 ---
 

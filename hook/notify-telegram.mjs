@@ -274,20 +274,35 @@ export function strings(cfg) {
 }
 
 // ---------------------------------------------------------------------------
-// Telegram API client (fetch built-in, timeout 10s, cho phép inject để test)
+// Telegram API client (fetch built-in, timeout 30s, cho phép inject để test)
 // ---------------------------------------------------------------------------
+
+export const TELEGRAM_API_TIMEOUT_MS = 30_000;
 
 export function makeTelegram(cfg, fetchFn = fetch) {
   const base = `https://api.telegram.org/bot${cfg.botToken}`;
-  async function call(method, params, timeoutMs = 10_000) {
-    const res = await fetchFn(`${base}/${method}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(params),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+  async function call(method, params, timeoutMs = TELEGRAM_API_TIMEOUT_MS) {
+    let res;
+    try {
+      res = await fetchFn(`${base}/${method}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(params),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (err) {
+      if (err?.name === 'TimeoutError' || String(err?.message || '').includes('aborted due to timeout')) {
+        throw new Error(`telegram ${method} timed out after ${Math.round(timeoutMs / 1000)}s`);
+      }
+      throw err;
+    }
     const data = await res.json();
-    if (!data.ok) throw new Error(`telegram ${method} failed: ${data.description || res.status}`);
+    if (!data.ok) {
+      const migrate = data.parameters?.migrate_to_chat_id;
+      throw new Error(
+        `telegram ${method} failed: ${data.description || res.status}${migrate ? ` (migrate_to_chat_id: ${migrate})` : ''}`
+      );
+    }
     return data.result;
   }
   return {
