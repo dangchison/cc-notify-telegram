@@ -52,6 +52,65 @@ test('runRemote: unknown provider fail rõ và không ghi provider lạ', async 
   assert.equal(readConfig(home).remote.providers.cursor, undefined);
 });
 
+test('runRemote: global command gửi từng provider vào providerThreads khi có topic mapping', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'ccnt-topic-route-'));
+  writeConfig(
+    {
+      botToken: 'T',
+      chatId: '-100',
+      enabledProviders: ['claude', 'codex', 'antigravity'],
+      providerThreads: { claude: 5, codex: 6, antigravity: 7 },
+      remote: false,
+    },
+    home
+  );
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    calls.push(JSON.parse(init.body));
+    return { json: async () => ({ ok: true, result: { message_id: calls.length } }) };
+  };
+  try {
+    assert.equal(await runRemote('on', { home, log: () => {}, cwd: '/repo/app' }), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls.map((body) => body.message_thread_id), [5, 6, 7]);
+  assert.match(calls[0].text, /cho claude/);
+  assert.match(calls[1].text, /cho codex/);
+  assert.match(calls[2].text, /cho antigravity/);
+});
+
+test('runRemote: global command không có providerThreads thì gửi một tin chung', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'ccnt-no-topic-route-'));
+  writeConfig(
+    {
+      botToken: 'T',
+      chatId: '-100',
+      enabledProviders: ['claude', 'codex', 'antigravity'],
+      remote: false,
+    },
+    home
+  );
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    calls.push(JSON.parse(init.body));
+    return { json: async () => ({ ok: true, result: { message_id: calls.length } }) };
+  };
+  try {
+    assert.equal(await runRemote('on', { home, log: () => {}, cwd: '/repo/app' }), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].message_thread_id, undefined);
+  assert.doesNotMatch(calls[0].text, /cho claude|cho codex|cho antigravity/);
+});
+
 test('parseArgs: giữ provider positional cho remote command', () => {
   const flags = parseArgs(['remote-perm', 'on', 'antigravity']);
   assert.deepEqual(flags._, ['remote-perm', 'on', 'antigravity']);

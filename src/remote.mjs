@@ -24,6 +24,39 @@ const MODES = {
   },
 };
 
+function activeProviders(config, provider) {
+  if (provider) return [provider];
+  const enabled = Array.isArray(config.enabledProviders) ? config.enabledProviders : ['claude'];
+  const ids = enabled.filter((id) => PROVIDERS.includes(id));
+  return ids.length ? ids : ['claude'];
+}
+
+function hasProviderTopics(config, providers) {
+  return providers.some((id) => config.providerThreads?.[id] != null && config.providerThreads[id] !== '');
+}
+
+async function sendStatusMessage({ config, home, provider, providers, texts, enabling, project, log }) {
+  if (provider || hasProviderTopics(config, providers)) {
+    for (const id of providers) {
+      const cfg = loadConfig({ home, providerId: id });
+      if (!hasCredentials(cfg)) continue;
+      await makeTelegram(cfg)
+        .sendMessage(enabling ? texts.onTg(project, id) : texts.offTg(project, id), { providerId: id })
+        .catch((err) =>
+          log(`⚠️  Không gửi được tin báo trạng thái cho ${id}: ${err.message || err} — cờ vẫn đã lưu.`)
+        );
+    }
+    return;
+  }
+
+  const cfg = loadConfig({ home, providerId: 'claude' });
+  if (hasCredentials(cfg)) {
+    await makeTelegram(cfg)
+      .sendMessage(enabling ? texts.onTg(project) : texts.offTg(project))
+      .catch((err) => log(`⚠️  Không gửi được tin báo trạng thái: ${err.message || err} — cờ vẫn đã lưu.`));
+  }
+}
+
 export async function runRemote(
   mode,
   { home = homedir(), log = console.log, cwd = process.cwd(), key = 'remote', provider } = {}
@@ -43,6 +76,7 @@ export async function runRemote(
     log(`Provider không hợp lệ "${provider}". Hỗ trợ: ${PROVIDERS.join(', ')}`);
     return false;
   }
+  const targetProviders = activeProviders(config, provider);
   const current = config[key] && typeof config[key] === 'object' ? config[key] : { global: config[key] === true, providers: {} };
   current.providers = current.providers || {};
   if (provider) {
@@ -63,17 +97,21 @@ export async function runRemote(
       log('⚠️  Chưa có allowedUserIds — KHÔNG ai duyệt được từ xa (fail-closed).');
       log('    Chạy `npx cc-notify-telegram init` để dò/thêm user ID được phép duyệt.');
     }
-    if (!isToggleEnabled(config, 'remote', provider || 'claude')) {
+    const missingRemote = targetProviders.filter((id) => !isToggleEnabled(config, 'remote', id));
+    if (missingRemote.length) {
       log('⚠️  Remote Ask đang TẮT — bật luôn bằng `npx cc-notify-telegram remote on`.');
     }
   }
 
-  const cfg = loadConfig({ home, providerId: provider || 'claude' });
-  if (hasCredentials(cfg)) {
-    const project = basename(cwd);
-    await makeTelegram(cfg)
-      .sendMessage(enabling ? texts.onTg(project, provider) : texts.offTg(project, provider), { providerId: provider })
-      .catch(() => log('⚠️  Không gửi được tin báo trạng thái (offline?) — cờ vẫn đã lưu.'));
-  }
+  await sendStatusMessage({
+    config,
+    home,
+    provider,
+    providers: targetProviders,
+    texts,
+    enabling,
+    project: basename(cwd),
+    log,
+  });
   return true;
 }
