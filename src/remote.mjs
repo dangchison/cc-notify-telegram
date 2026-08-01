@@ -35,25 +35,48 @@ function hasProviderTopics(config, providers) {
   return providers.some((id) => config.providerThreads?.[id] != null && config.providerThreads[id] !== '');
 }
 
+function isTransientSendError(err) {
+  const text = `${err?.message || ''} ${err?.cause?.code || ''}`;
+  return /fetch failed|timed out|UND_ERR_CONNECT_TIMEOUT|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN/i.test(text);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function sendWithRetry(tg, text, extra, { attempts = 2, delayMs = 1000 } = {}) {
+  let lastErr;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await tg.sendMessage(text, extra);
+    } catch (err) {
+      lastErr = err;
+      if (attempt >= attempts || !isTransientSendError(err)) break;
+      await sleep(delayMs);
+    }
+  }
+  throw lastErr;
+}
+
 async function sendStatusMessage({ config, home, provider, providers, texts, enabling, project, log }) {
   if (provider || hasProviderTopics(config, providers)) {
     for (const id of providers) {
       const cfg = loadConfig({ home, providerId: id });
       if (!hasCredentials(cfg)) continue;
-      await makeTelegram(cfg)
-        .sendMessage(enabling ? texts.onTg(project, id) : texts.offTg(project, id), { providerId: id })
-        .catch((err) =>
-          log(`⚠️  Không gửi được tin báo trạng thái cho ${id}: ${err.message || err} — cờ vẫn đã lưu.`)
-        );
+      await sendWithRetry(makeTelegram(cfg), enabling ? texts.onTg(project, id) : texts.offTg(project, id), {
+        providerId: id,
+      }).catch((err) =>
+        log(`⚠️  Không gửi được tin báo trạng thái cho ${id}: ${err.message || err} — cờ vẫn đã lưu.`)
+      );
     }
     return;
   }
 
   const cfg = loadConfig({ home, providerId: 'claude' });
   if (hasCredentials(cfg)) {
-    await makeTelegram(cfg)
-      .sendMessage(enabling ? texts.onTg(project) : texts.offTg(project))
-      .catch((err) => log(`⚠️  Không gửi được tin báo trạng thái: ${err.message || err} — cờ vẫn đã lưu.`));
+    await sendWithRetry(makeTelegram(cfg), enabling ? texts.onTg(project) : texts.offTg(project)).catch((err) =>
+      log(`⚠️  Không gửi được tin báo trạng thái: ${err.message || err} — cờ vẫn đã lưu.`)
+    );
   }
 }
 
