@@ -169,6 +169,16 @@ Không ai reply trong `remoteAskTimeoutSec` (mặc định 15 phút) → câu h�
 
 > Codex note: completion uses the official `Stop` lifecycle hook, and remote permission uses `PermissionRequest`. Remote Ask for Codex needs a Codex App Server bridge (`tool/requestUserInput`, experimental) and should not be treated as equivalent to Claude `AskUserQuestion` hooks yet.
 
+**Codex App Server Ask bridge.** Với client có thể launch Codex App Server qua stdio, dùng `cc-notify-telegram codex-bridge` làm app-server command. Bridge proxy JSON-RPC giữa client và `codex app-server --stdio`, bật experimental App Server API, rồi intercept request thật `item/tool/requestUserInput`:
+
+```
+Codex client ──JSON-RPC──▶ cc-notify-telegram codex-bridge ──JSON-RPC──▶ codex app-server --stdio
+                                │
+                                └─▶ ❓ Telegram reply → { answers: [...] } → app-server
+```
+
+Nếu Telegram timeout hoặc bạn reply `local`, request được trả về client local xử lý. Bridge này chỉ xử lý ASK; các App Server approval request vẫn pass-through về client.
+
 **Remote Permission.** Khi bật (`remote-perm on`, cần `remote on` sẵn), hook Permission Interceptor chặn *đúng lúc hộp thoại quyền sắp hiện*, gửi nguyên văn thứ đang được xin quyền kèm 4 nút:
 
 ```
@@ -196,6 +206,7 @@ Hỗ trợ cả lệnh `cc-notify-telegram` và alias `ai-notify-telegram`:
 | `npx cc-notify-telegram remote off [provider]` | Tắt Remote Ask toàn cục hoặc cho riêng từng Agent |
 | `npx cc-notify-telegram remote-perm on [provider]` | Bật Remote Permission toàn cục hoặc cho riêng từng Agent |
 | `npx cc-notify-telegram remote-perm off [provider]` | Tắt Remote Permission toàn cục hoặc cho riêng từng Agent |
+| `npx cc-notify-telegram codex-bridge` | Stdio proxy cho Codex App Server, intercept `item/tool/requestUserInput` qua Telegram |
 | `npx cc-notify-telegram uninstall` | Gỡ hooks khỏi các Agent (`--purge`: xoá cả config/token, state, block instruction) |
 
 ---
@@ -249,7 +260,7 @@ npx -y github:dangchison/cc-notify-telegram uninstall --purge  # xoá sạch c�
 
 **cc-notify-telegram (ai-notify-telegram)** connects **Claude Code**, **OpenAI Codex**, and **Google Antigravity** to Telegram:
 1. **Completion & Escalation Pings**: Sends a condensed summary when an agent finishes a task (via hidden `<!-- AI_NOTIFY_DONE: … -->` or `<!-- CC_NOTIFY_DONE: … -->` markers in `CLAUDE.md`, `CODEX.md`, or `AGENTS.md`) plus a 🛑 ping when an agent is stuck.
-2. **Remote Ask**: Intercepts user questions sent by Claude (`AskUserQuestion`) or Antigravity (`ask_question`), forwards them to Telegram tagged `[Agent · Project · Session]`, and feeds your reply ("1A", "2B", free text) back into the session. Codex Ask requires a Codex App Server bridge (`tool/requestUserInput`, experimental).
+2. **Remote Ask**: Intercepts user questions sent by Claude (`AskUserQuestion`) or Antigravity (`ask_question`), forwards them to Telegram tagged `[Agent · Project · Session]`, and feeds your reply ("1A", "2B", free text) back into the session. Codex Ask is supported through the Codex App Server stdio bridge when a real `item/tool/requestUserInput` request is emitted (`tool/requestUserInput`, experimental).
 3. **Remote Permission**: Intercepts command/tool permission dialogs (`PermissionRequest`, command approval, `ask_permission`), sending inline approval buttons (Allow / Deny / Allow-all-for-session / Handle at machine). Only Telegram user IDs in `allowedUserIds` can approve (fail-closed).
 4. **Multi-Agent & Per-Provider Controls**: Manage settings globally or per-agent (`npx cc-notify-telegram remote on codex`, `npx cc-notify-telegram remote-perm off claude`). Smart Telegram topic fallback ensures messages are never lost even if a forum thread is deleted.
 

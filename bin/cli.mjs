@@ -6,6 +6,7 @@ import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 
 import { hasCredentials, loadConfig, makeTelegram, strings } from '../hook/notify-telegram.mjs';
+import { runCodexAppServerBridge } from '../src/codex-app-server-bridge.mjs';
 import { runInit } from '../src/init.mjs';
 import { runRemote } from '../src/remote.mjs';
 import { runStatus } from '../src/status.mjs';
@@ -61,6 +62,9 @@ Cách dùng:
                                     nút bấm Telegram — chỉ allowedUserIds mới bấm được)
   npx cc-notify-telegram remote-perm on antigravity
                                     Bật/tắt Remote Permission riêng cho provider
+  npx cc-notify-telegram codex-bridge
+                                    Stdio proxy cho Codex App Server; intercept
+                                    item/tool/requestUserInput qua Telegram
   npx cc-notify-telegram uninstall  Gỡ hooks (--purge: xoá cả config/token + CLAUDE.md block)
 
 Cờ cho init (non-interactive):
@@ -99,6 +103,8 @@ async function main() {
     }
     case 'status':
       return runStatus({});
+    case 'codex-bridge':
+      return runCodexAppServerBridge();
     case 'remote':
       return runRemote(flags._[1], { provider: flags._[2] });
     case 'remote-perm':
