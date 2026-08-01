@@ -7,8 +7,10 @@ import {
   isLocalKeyword,
   loadConfig,
   makeTelegram,
+  promptTelegramPermission,
   promptTelegramAsk,
   strings,
+  writeSessionAllow,
 } from '../hook/notify-telegram.mjs';
 
 const BRIDGE_CLIENT_INFO = {
@@ -147,9 +149,208 @@ export async function answerToolRequestUserInput(
   return { answers };
 }
 
+function appServerSessionId(params = {}) {
+  return String(params.threadId || params.conversationId || params.turnId || params.callId || '');
+}
+
+function appServerSuffix(params = {}) {
+  return String(params.turnId || params.itemId || params.callId || params.approvalId || '').slice(-4);
+}
+
+function commandToString(command) {
+  return Array.isArray(command) ? command.join(' ') : String(command || '');
+}
+
+export function appServerApprovalToPermissionPayload(message) {
+  const params = message.params || {};
+  const sessionId = appServerSessionId(params);
+  const base = {
+    sessionId,
+    payload: {
+      session_id: sessionId,
+      cwd: params.cwd,
+      threadId: params.threadId,
+      turnId: params.turnId,
+      itemId: params.itemId || params.callId,
+    },
+    project: 'codex-app-server',
+    suffix: appServerSuffix(params),
+  };
+
+  if (message.method === 'item/commandExecution/requestApproval') {
+    return {
+      ...base,
+      toolName: 'Command',
+      toolInput: {
+        command: commandToString(params.command),
+        cwd: params.cwd,
+        reason: params.reason,
+        approvalId: params.approvalId,
+        commandActions: params.commandActions,
+        networkApprovalContext: params.networkApprovalContext,
+        additionalPermissions: params.additionalPermissions,
+        proposedExecpolicyAmendment: params.proposedExecpolicyAmendment,
+        proposedNetworkPolicyAmendments: params.proposedNetworkPolicyAmendments,
+      },
+    };
+  }
+
+  if (message.method === 'item/fileChange/requestApproval') {
+    return {
+      ...base,
+      toolName: 'FileChange',
+      toolInput: {
+        reason: params.reason,
+        grantRoot: params.grantRoot,
+      },
+    };
+  }
+
+  if (message.method === 'item/permissions/requestApproval') {
+    return {
+      ...base,
+      toolName: 'Permissions',
+      toolInput: {
+        cwd: params.cwd,
+        reason: params.reason,
+        permissions: params.permissions,
+        environmentId: params.environmentId,
+      },
+    };
+  }
+
+  if (message.method === 'execCommandApproval') {
+    return {
+      ...base,
+      toolName: 'Command',
+      toolInput: {
+        command: commandToString(params.command),
+        cwd: params.cwd,
+        reason: params.reason,
+        approvalId: params.approvalId,
+        parsedCmd: params.parsedCmd,
+      },
+    };
+  }
+
+  if (message.method === 'applyPatchApproval') {
+    return {
+      ...base,
+      toolName: 'FileChange',
+      toolInput: {
+        reason: params.reason,
+        grantRoot: params.grantRoot,
+        fileChanges: params.fileChanges,
+      },
+    };
+  }
+
+  return null;
+}
+
+function compactGrantedPermissions(requested = {}) {
+  const granted = {};
+  if (requested.network) granted.network = requested.network;
+  if (requested.fileSystem) granted.fileSystem = requested.fileSystem;
+  return granted;
+}
+
+export function appServerApprovalResponse(method, action, params = {}, str = strings({ lang: 'vi' })) {
+  if (method === 'item/commandExecution/requestApproval') {
+    if (action === 'd') return { decision: 'decline' };
+    return { decision: action === 's' ? 'acceptForSession' : 'accept' };
+  }
+
+  if (method === 'item/fileChange/requestApproval') {
+    if (action === 'd') return { decision: 'decline' };
+    return { decision: action === 's' ? 'acceptForSession' : 'accept' };
+  }
+
+  if (method === 'item/permissions/requestApproval') {
+    if (action === 'd') return { permissions: {}, scope: 'turn', strictAutoReview: true };
+    return {
+      permissions: compactGrantedPermissions(params.permissions),
+      scope: action === 's' ? 'session' : 'turn',
+    };
+  }
+
+  if (method === 'execCommandApproval' || method === 'applyPatchApproval') {
+    if (action === 'd') return { decision: { denied: { rejection: str.permDenyReason } } };
+    return { decision: action === 's' ? 'approved_for_session' : 'approved' };
+  }
+
+  return null;
+}
+
+const APP_SERVER_APPROVAL_METHODS = new Set([
+  'item/commandExecution/requestApproval',
+  'item/fileChange/requestApproval',
+  'item/permissions/requestApproval',
+  'execCommandApproval',
+  'applyPatchApproval',
+]);
+
+function hhmm(ts) {
+  return new Date(ts).toTimeString().slice(0, 5);
+}
+
+export async function answerAppServerApproval(
+  message,
+  { cfg, tg, env = process.env, home, promptPerm = promptTelegramPermission } = {}
+) {
+  if (!APP_SERVER_APPROVAL_METHODS.has(message?.method)) return null;
+
+  const request = appServerApprovalToPermissionPayload(message);
+  if (!request) return null;
+
+  const prompt = await promptPerm({
+    payload: request.payload,
+    cfg,
+    tg,
+    env,
+    home,
+    toolName: request.toolName,
+    toolInput: request.toolInput,
+    project: request.project,
+    suffix: request.suffix,
+  });
+
+  if (prompt.type === 'session-allow') {
+    return appServerApprovalResponse(message.method, 'a', message.params, strings(cfg));
+  }
+  if (prompt.type !== 'ok') return null;
+
+  const { outcome, anchorId, dir } = prompt;
+  const str = strings(cfg);
+  if (outcome.type !== 'callback' || outcome.action === 'l') {
+    await tg
+      .editMessageText(anchorId, outcome.type === 'timeout' ? str.permTimedOut : str.permMovedLocal)
+      .catch(() => {});
+    return null;
+  }
+
+  const who = outcome.fromName ? ` (${outcome.fromName})` : '';
+  if (outcome.action === 'd') {
+    await tg.editMessageText(anchorId, str.permDenied(who)).catch(() => {});
+    return appServerApprovalResponse(message.method, 'd', message.params, str);
+  }
+  if (outcome.action === 's') {
+    const until = writeSessionAllow(dir, request.sessionId, cfg.sessionAllowTtlMin);
+    await tg.editMessageText(anchorId, str.permAllowedSession(who, hhmm(until))).catch(() => {});
+    return appServerApprovalResponse(message.method, 's', message.params, str);
+  }
+
+  await tg.editMessageText(anchorId, str.permAllowed(who)).catch(() => {});
+  return appServerApprovalResponse(message.method, 'a', message.params, str);
+}
+
 export async function handleServerRequest(message, context) {
-  if (message?.method !== 'item/tool/requestUserInput') return null;
-  const result = await answerToolRequestUserInput(message, context);
+  let result = null;
+  if (message?.method === 'item/tool/requestUserInput') {
+    result = await answerToolRequestUserInput(message, context);
+  } else if (APP_SERVER_APPROVAL_METHODS.has(message?.method)) {
+    result = await answerAppServerApproval(message, context);
+  }
   if (!result) return null;
   return { id: message.id, result };
 }

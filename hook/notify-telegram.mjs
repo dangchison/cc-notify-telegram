@@ -1038,13 +1038,25 @@ export function describePermission(toolName, toolInput) {
   const fenced = (value, max = 1500) => ['```', capText(value, max), '```'];
   const out = [];
 
-  if (toolName === 'Bash' || toolName === 'PowerShell') {
+  if (toolName === 'Bash' || toolName === 'PowerShell' || toolName === 'Command') {
     if (t.description) out.push(String(t.description));
+    if (t.reason) out.push(String(t.reason));
+    if (t.cwd) out.push(`cwd: ${t.cwd}`);
     if (t.command) out.push(...fenced(t.command, 3000));
+    if (t.networkApprovalContext) out.push(...fenced(JSON.stringify(t.networkApprovalContext, null, 2), 800));
+    if (t.additionalPermissions) out.push(...fenced(JSON.stringify(t.additionalPermissions, null, 2), 1200));
   } else if (toolName === 'Edit' || toolName === 'Write' || toolName === 'NotebookEdit') {
     if (t.file_path) out.push(String(t.file_path));
     const body = t.new_string ?? t.content ?? t.new_source;
     if (body != null) out.push(...fenced(body));
+  } else if (toolName === 'FileChange') {
+    if (t.reason) out.push(String(t.reason));
+    if (t.grantRoot) out.push(`grantRoot: ${t.grantRoot}`);
+    if (t.fileChanges) out.push(...fenced(JSON.stringify(t.fileChanges, null, 2), 2000));
+  } else if (toolName === 'Permissions') {
+    if (t.reason) out.push(String(t.reason));
+    if (t.cwd) out.push(`cwd: ${t.cwd}`);
+    if (t.permissions) out.push(...fenced(JSON.stringify(t.permissions, null, 2), 1600));
   } else if (toolName === 'WebFetch') {
     if (t.url) out.push(String(t.url));
     if (t.prompt) out.push(capText(t.prompt, 400));
@@ -1118,47 +1130,35 @@ export function buildPlanNotice({ project, suffix, str, providerId }) {
   return str.planNotice(tag, providerId ? providerDisplayName(providerId) : undefined);
 }
 
-async function runPerm(payload, cfg, tg, env, home = homedir()) {
-  if (!cfg.remote || !cfg.remotePermission) return null;
-  // FAIL-CLOSED: không khai báo ai được duyệt thì không hỏi từ xa, hộp thoại về máy.
-  if (!cfg.allowedUserIds.length) return null;
-  const toolName = payload.tool_name;
-  if (!toolName) return null;
-  // AskUserQuestion đã có Remote Ask (PreToolUse) lo — không bao giờ đưa vào luồng nút bấm.
-  if (toolName === 'AskUserQuestion') return null;
-
-  const str = strings(cfg);
-
-  // Plan (và tool notify-only khác): chỉ gửi 1 tin BÁO rồi nhả về máy — KHÔNG nút, KHÔNG pending,
-  // KHÔNG đụng session-allow (đặt trước readSessionAllow để "cho phép tất cả" không nuốt plan).
-  if (NOTIFY_ONLY_TOOLS.has(toolName)) {
-    await tg
-      .sendMessage(
-        buildPlanNotice({
-          project: projectName(payload, env),
-          suffix: String(payload.session_id || '').slice(-4),
-          str,
-          providerId: cfg.providerId,
-        }),
-        { providerId: cfg.providerId }
-      )
-      .catch(() => {});
-    return null;
-  }
+export async function promptTelegramPermission({
+  payload,
+  cfg,
+  tg,
+  env,
+  home = homedir(),
+  toolName,
+  toolInput,
+  project,
+  suffix,
+}) {
+  if (!cfg.remote || !cfg.remotePermission) return { type: 'remote-off' };
+  if (!cfg.allowedUserIds.length) return { type: 'no-allowed-users' };
+  if (!toolName || toolName === 'AskUserQuestion') return { type: 'invalid' };
 
   const dir = ensureStateDirs(home);
   gcStateDir(dir);
 
-  // Đã bấm "cho phép tất cả" và còn hạn → duyệt thẳng, KHÔNG gửi tin (đây là cơ chế chống spam).
-  if (readSessionAllow(dir, payload.session_id)) return formatPermissionOutput(cfg.providerId, 'allow');
+  const sessionId = payload.session_id || '';
+  if (readSessionAllow(dir, sessionId)) return { type: 'session-allow', dir };
 
-  const key = pendingKey(payload.session_id, [{ question: `${toolName}:${JSON.stringify(payload.tool_input ?? null)}` }]);
+  const str = strings(cfg);
+  const key = pendingKey(sessionId, [{ question: `${toolName}:${JSON.stringify(toolInput ?? null)}` }]);
   const chunks = chunkMessage(
     buildPermMessage({
       toolName,
-      toolInput: payload.tool_input,
-      project: projectName(payload, env),
-      suffix: String(payload.session_id || '').slice(-4),
+      toolInput,
+      project,
+      suffix,
       str,
       providerId: cfg.providerId,
     })
@@ -1188,7 +1188,7 @@ async function runPerm(payload, cfg, tg, env, home = homedir()) {
     if (messageIds.length) {
       await tg.editMessageText(messageIds[messageIds.length - 1], str.permSendFailed).catch(() => {});
     }
-    return null;
+    return { type: 'send-failed' };
   }
   const anchorId = messageIds[messageIds.length - 1];
 
@@ -1198,7 +1198,7 @@ async function runPerm(payload, cfg, tg, env, home = homedir()) {
       kind: 'perm',
       messageId: anchorId,
       messageIds,
-      sessionId: payload.session_id || '',
+      sessionId,
       toolName,
       sentAt: Date.now(),
     })
@@ -1220,6 +1220,52 @@ async function runPerm(payload, cfg, tg, env, home = homedir()) {
   } catch {
     // đã bị GC/sweep
   }
+
+  return { type: 'ok', outcome, anchorId, key, dir };
+}
+
+async function runPerm(payload, cfg, tg, env, home = homedir()) {
+  if (!cfg.remote || !cfg.remotePermission) return null;
+  // FAIL-CLOSED: không khai báo ai được duyệt thì không hỏi từ xa, hộp thoại về máy.
+  if (!cfg.allowedUserIds.length) return null;
+  const toolName = payload.tool_name;
+  if (!toolName) return null;
+  // AskUserQuestion đã có Remote Ask (PreToolUse) lo — không bao giờ đưa vào luồng nút bấm.
+  if (toolName === 'AskUserQuestion') return null;
+
+  const str = strings(cfg);
+
+  // Plan (và tool notify-only khác): chỉ gửi 1 tin BÁO rồi nhả về máy — KHÔNG nút, KHÔNG pending,
+  // KHÔNG đụng session-allow (đặt trước readSessionAllow để "cho phép tất cả" không nuốt plan).
+  if (NOTIFY_ONLY_TOOLS.has(toolName)) {
+    await tg
+      .sendMessage(
+        buildPlanNotice({
+          project: projectName(payload, env),
+          suffix: String(payload.session_id || '').slice(-4),
+          str,
+          providerId: cfg.providerId,
+        }),
+        { providerId: cfg.providerId }
+      )
+      .catch(() => {});
+    return null;
+  }
+
+  const prompt = await promptTelegramPermission({
+    payload,
+    cfg,
+    tg,
+    env,
+    home,
+    toolName,
+    toolInput: payload.tool_input,
+    project: projectName(payload, env),
+    suffix: String(payload.session_id || '').slice(-4),
+  });
+  if (prompt.type === 'session-allow') return formatPermissionOutput(cfg.providerId, 'allow');
+  if (prompt.type !== 'ok') return null;
+  const { outcome, anchorId, dir } = prompt;
 
   if (outcome.type === 'callback' && outcome.action !== 'l') {
     const who = outcome.fromName ? ` (${outcome.fromName})` : '';
