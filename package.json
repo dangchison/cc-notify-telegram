@@ -4,7 +4,8 @@
   "description": "Claude Code ↔ Telegram: báo khi xong việc/bế tắc + trả lời AskUserQuestion từ Telegram khi vắng máy (Remote Ask)",
   "type": "module",
   "bin": {
-    "cc-notify-telegram": "bin/cli.mjs"
+    "cc-notify-telegram": "bin/cli.mjs",
+    "ai-notify-telegram": "bin/cli.mjs"
   },
   "files": [
     "bin/",

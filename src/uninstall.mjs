@@ -4,14 +4,25 @@
 import { copyFileSync, existsSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 
-import { stateDir } from '../hook/notify-telegram.mjs';
-import { configPath } from './config.mjs';
+import { legacyStateDir, stateDir } from '../hook/notify-telegram.mjs';
+import { configPath, legacyConfigPath } from './config.mjs';
 import { installPaths } from './init.mjs';
 import { removeOurEntries } from './settings.mjs';
 import { hasBlock, removeBlock } from './snippet.mjs';
+import { ProviderRegistry } from './providers/index.mjs';
 
 export async function runUninstall(flags, { home = homedir(), log = console.log } = {}) {
   const paths = installPaths(home);
+  const registry = new ProviderRegistry();
+
+  for (const provider of registry.getAll().filter((p) => p.id !== 'claude')) {
+    try {
+      const result = await provider.unregisterHooks({ home });
+      if (result.removedFiles.length) log(`✅ Đã gỡ ${provider.displayName}: ${result.removedFiles.join(', ')}`);
+    } catch (err) {
+      log(`⚠️  Không gỡ được ${provider.displayName}: ${err.message}`);
+    }
+  }
 
   if (existsSync(paths.settingsFile)) {
     try {
@@ -21,7 +32,7 @@ export async function runUninstall(flags, { home = homedir(), log = console.log 
         const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
         copyFileSync(paths.settingsFile, `${paths.settingsFile}.bak-${stamp}`);
         writeFileSync(paths.settingsFile, JSON.stringify(next, null, 2) + '\n');
-        log('✅ Đã gỡ 4 hook entry khỏi settings.json (có backup .bak-*)');
+        log('✅ Đã gỡ 5 hook entry khỏi settings.json (có backup .bak-*)');
       }
     } catch {
       log(`⚠️  Không parse được ${paths.settingsFile} — bỏ qua, tự gỡ entry cc-notify-telegram bằng tay.`);
@@ -34,12 +45,14 @@ export async function runUninstall(flags, { home = homedir(), log = console.log 
   }
 
   if (flags.purge) {
-    const cfgFile = configPath(home);
-    if (existsSync(cfgFile)) {
-      unlinkSync(cfgFile);
-      log('✅ Đã xoá config (bot token).');
+    for (const cfgFile of [configPath(home), legacyConfigPath(home)]) {
+      if (existsSync(cfgFile)) {
+        unlinkSync(cfgFile);
+        log(`✅ Đã xoá config: ${cfgFile}`);
+      }
     }
     rmSync(stateDir(home), { recursive: true, force: true });
+    rmSync(legacyStateDir(home), { recursive: true, force: true });
     if (existsSync(paths.claudeMdFile)) {
       const content = readFileSync(paths.claudeMdFile, 'utf8');
       if (hasBlock(content)) {

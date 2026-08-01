@@ -34,6 +34,15 @@ import { pathToFileURL } from 'node:url';
 
 export const MARKER_DONE = 'CC_NOTIFY_DONE';
 export const MARKER_ESCALATE = 'CC_NOTIFY_ESCALATE';
+export const AI_MARKER_DONE = 'AI_NOTIFY_DONE';
+export const AI_MARKER_ESCALATE = 'AI_NOTIFY_ESCALATE';
+export const PROVIDERS = ['claude', 'codex', 'antigravity'];
+
+const PROVIDER_DISPLAY = {
+  claude: 'Claude',
+  codex: 'Codex',
+  antigravity: 'Antigravity',
+};
 
 const POLL_LONG_SEC = 20; // long-poll getUpdates mỗi vòng
 const LOCK_STALE_MS = 60_000; // heartbeat cũ hơn ngưỡng này = poller chết → takeover
@@ -45,29 +54,120 @@ export function claudeDir(home = homedir()) {
   return join(home, '.claude');
 }
 
+export function configDir(home = homedir()) {
+  return join(home, '.config', 'ai-notify-telegram');
+}
+
+export function configFile(home = homedir()) {
+  return join(configDir(home), 'config.json');
+}
+
+export function legacyConfigFile(home = homedir()) {
+  return join(claudeDir(home), 'cc-notify-telegram.json');
+}
+
 export function stateDir(home = homedir()) {
+  return join(configDir(home), 'state');
+}
+
+export function legacyStateDir(home = homedir()) {
   return join(claudeDir(home), 'cc-notify-telegram');
 }
 
-export function loadConfig({ env = process.env, home = homedir() } = {}) {
-  let file = {};
-  try {
-    file = JSON.parse(readFileSync(join(claudeDir(home), 'cc-notify-telegram.json'), 'utf8'));
-  } catch {
-    // chưa cài config → mọi event tự thoát im lặng
+export function normalizeProviderId(value) {
+  return PROVIDERS.includes(value) ? value : 'claude';
+}
+
+export function providerDisplayName(providerId = 'claude') {
+  return PROVIDER_DISPLAY[normalizeProviderId(providerId)];
+}
+
+function boolOrDefault(value, fallback = false) {
+  return typeof value === 'boolean' ? value : fallback;
+}
+
+function normalizeProviderMap(value, fallback = false) {
+  const input = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  return Object.fromEntries(PROVIDERS.map((id) => [id, boolOrDefault(input[id], fallback)]));
+}
+
+function normalizeToggle(value, fallback = false, { legacy = false } = {}) {
+  if (typeof value === 'boolean') {
+    if (legacy) return { global: value, providers: { claude: value, codex: false, antigravity: false } };
+    return { global: value, providers: normalizeProviderMap(null, value) };
   }
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const global = boolOrDefault(value.global, fallback);
+    return { global, providers: normalizeProviderMap(value.providers, global) };
+  }
+  return { global: fallback, providers: normalizeProviderMap(null, fallback) };
+}
+
+function normalizeEnabledProviders(value) {
+  if (!Array.isArray(value)) return ['claude'];
+  const ids = [...new Set(value.filter((id) => PROVIDERS.includes(id)))];
+  return ids.length ? ids : ['claude'];
+}
+
+function readConfigFile(home) {
+  try {
+    return { data: JSON.parse(readFileSync(configFile(home), 'utf8')), legacy: false };
+  } catch {
+    try {
+      return { data: JSON.parse(readFileSync(legacyConfigFile(home), 'utf8')), legacy: true };
+    } catch {
+      return { data: {}, legacy: false };
+    }
+  }
+}
+
+export function isProviderEnabled(cfg, providerId = 'claude') {
+  return (cfg.enabledProviders || ['claude']).includes(normalizeProviderId(providerId));
+}
+
+export function isRemoteEnabled(cfg, providerId = 'claude') {
+  const id = normalizeProviderId(providerId);
+  if (!isProviderEnabled(cfg, id)) return false;
+  const toggle = cfg.remoteConfig || normalizeToggle(cfg.remote, false);
+  return toggle.global === true && toggle.providers[id] === true;
+}
+
+export function isRemotePermEnabled(cfg, providerId = 'claude') {
+  const id = normalizeProviderId(providerId);
+  if (!isProviderEnabled(cfg, id)) return false;
+  const toggle = cfg.remotePermissionConfig || normalizeToggle(cfg.remotePermission, false);
+  return toggle.global === true && toggle.providers[id] === true;
+}
+
+export function loadConfig({ env = process.env, home = homedir(), providerId = 'claude' } = {}) {
+  const source = readConfigFile(home);
+  const file = source.data;
   const timeout = Number(file.remoteAskTimeoutSec);
   const ttl = Number(file.sessionAllowTtlMin);
-  const onOff = (envValue, fileValue) =>
-    envValue != null ? ['1', 'true', 'on'].includes(String(envValue).toLowerCase()) : fileValue === true;
-  return {
+  const envBool = (envValue, fallback) =>
+    envValue != null ? ['1', 'true', 'on'].includes(String(envValue).toLowerCase()) : fallback;
+  const remoteConfig = normalizeToggle(file.remote, false, { legacy: source.legacy });
+  const remotePermissionConfig = normalizeToggle(file.remotePermission, false, { legacy: source.legacy });
+  if (env.CC_NOTIFY_REMOTE != null || env.AI_NOTIFY_REMOTE != null) {
+    const enabled = envBool(env.AI_NOTIFY_REMOTE ?? env.CC_NOTIFY_REMOTE, remoteConfig.global);
+    remoteConfig.global = enabled;
+    remoteConfig.providers = normalizeProviderMap(null, enabled);
+  }
+  if (env.CC_NOTIFY_REMOTE_PERM != null || env.AI_NOTIFY_REMOTE_PERM != null) {
+    const enabled = envBool(env.AI_NOTIFY_REMOTE_PERM ?? env.CC_NOTIFY_REMOTE_PERM, remotePermissionConfig.global);
+    remotePermissionConfig.global = enabled;
+    remotePermissionConfig.providers = normalizeProviderMap(null, enabled);
+  }
+  const cfg = {
     botToken: env.TELEGRAM_BOT_TOKEN || file.botToken || '',
     chatId: env.TELEGRAM_CHAT_ID || file.chatId || '',
     threadId: env.TELEGRAM_THREAD_ID || file.threadId || undefined,
+    providerThreads: file.providerThreads && typeof file.providerThreads === 'object' ? file.providerThreads : {},
+    enabledProviders: normalizeEnabledProviders(file.enabledProviders),
     lang: file.lang === 'en' ? 'en' : 'vi',
     silent: file.silent === true,
-    remote: onOff(env.CC_NOTIFY_REMOTE, file.remote),
-    remotePermission: onOff(env.CC_NOTIFY_REMOTE_PERM, file.remotePermission),
+    remoteConfig,
+    remotePermissionConfig,
     // So sánh dạng chuỗi: config có thể ghi số hoặc chuỗi, from.id của Telegram luôn là số.
     allowedUserIds: (Array.isArray(file.allowedUserIds) ? file.allowedUserIds : [])
       .map((id) => String(id).trim())
@@ -76,6 +176,9 @@ export function loadConfig({ env = process.env, home = homedir() } = {}) {
     remoteAskTimeoutSec:
       Number.isFinite(timeout) && timeout > 0 ? Math.min(timeout, MAX_ASK_TIMEOUT_SEC) : 900,
   };
+  cfg.remote = isRemoteEnabled(cfg, providerId);
+  cfg.remotePermission = isRemotePermEnabled(cfg, providerId);
+  return cfg;
 }
 
 export function hasCredentials(cfg) {
@@ -91,8 +194,8 @@ const STRINGS = {
     doneFallback: '— đã hoàn thành công việc',
     donePlain: 'đã hoàn thành công việc',
     escalateFallback: '🛑 Cần bạn xử lý',
-    escalateSuffix: (project) => `— ${project}: mở Claude Code xem chi tiết`,
-    askHeader: (tag) => `❓ ${tag} Claude đang hỏi:`,
+    escalateSuffix: (project, provider = 'Claude Code') => `— ${project}: mở ${provider} xem chi tiết`,
+    askHeader: (tag, provider = 'Claude') => `❓ ${tag} ${provider} đang hỏi:`,
     askFooter:
       '↩️ Reply tin này để trả lời (vd: "1A" / "1A, 2B" / mô tả tự do).\nReply "local" nếu muốn trả lời tại máy.',
     askMulti: '(chọn được nhiều)',
@@ -106,7 +209,7 @@ const STRINGS = {
     answerPrefix: (text) => `Người dùng trả lời qua Telegram: "${text}"`,
     answerResolved: (parts) => `(Diễn giải lựa chọn: ${parts.join('; ')})`,
     notifyPrefix: '🔔',
-    permHeader: (tag) => `🔐 ${tag} Claude xin quyền dùng:`,
+    permHeader: (tag, provider = 'Claude') => `🔐 ${tag} ${provider} xin quyền dùng:`,
     permFooter: '👇 Chọn bên dưới — chỉ tài khoản trong allowlist mới bấm được.',
     permNoDetail: '(không có chi tiết)',
     btnAllow: '✅ Cho phép',
@@ -123,15 +226,15 @@ const STRINGS = {
     permSendFailed: '⚠️ Không gửi được đầy đủ nội dung — yêu cầu quyền chuyển về máy.',
     permClosed: '⛔ Yêu cầu quyền đã đóng (lượt làm việc kết thúc).',
     permNoRight: 'Bạn không có quyền duyệt yêu cầu này.',
-    planNotice: (tag) =>
-      `📋 ${tag} Claude có plan cần bạn duyệt — mở Claude Code để đọc và chọn (Accept / Revise / Reject).`,
+    planNotice: (tag, provider = 'Claude Code') =>
+      `📋 ${tag} ${provider} có plan cần bạn duyệt — mở ${provider} để đọc và chọn (Accept / Revise / Reject).`,
   },
   en: {
     doneFallback: '— task completed',
     donePlain: 'task completed',
     escalateFallback: '🛑 Needs your attention',
-    escalateSuffix: (project) => `— ${project}: open Claude Code for details`,
-    askHeader: (tag) => `❓ ${tag} Claude is asking:`,
+    escalateSuffix: (project, provider = 'Claude Code') => `— ${project}: open ${provider} for details`,
+    askHeader: (tag, provider = 'Claude') => `❓ ${tag} ${provider} is asking:`,
     askFooter:
       '↩️ Reply to this message to answer (e.g. "1A" / "1A, 2B" / free text).\nReply "local" to answer at the machine.',
     askMulti: '(multiple choices allowed)',
@@ -145,7 +248,7 @@ const STRINGS = {
     answerPrefix: (text) => `User answered via Telegram: "${text}"`,
     answerResolved: (parts) => `(Interpreted choices: ${parts.join('; ')})`,
     notifyPrefix: '🔔',
-    permHeader: (tag) => `🔐 ${tag} Claude is requesting permission to use:`,
+    permHeader: (tag, provider = 'Claude') => `🔐 ${tag} ${provider} is requesting permission to use:`,
     permFooter: '👇 Choose below — only allowlisted accounts can act.',
     permNoDetail: '(no details)',
     btnAllow: '✅ Allow',
@@ -161,8 +264,8 @@ const STRINGS = {
     permSendFailed: '⚠️ Could not send the full request — falling back to the machine.',
     permClosed: '⛔ Permission request closed (turn ended).',
     permNoRight: 'You are not allowed to approve this request.',
-    planNotice: (tag) =>
-      `📋 ${tag} Claude has a plan to review — open Claude Code to read and choose (Accept / Revise / Reject).`,
+    planNotice: (tag, provider = 'Claude Code') =>
+      `📋 ${tag} ${provider} has a plan to review — open ${provider} to read and choose (Accept / Revise / Reject).`,
   },
 };
 
@@ -188,14 +291,27 @@ export function makeTelegram(cfg, fetchFn = fetch) {
     return data.result;
   }
   return {
-    sendMessage: (text, extra = {}) =>
-      call('sendMessage', {
+    sendMessage: async (text, extra = {}) => {
+      const provider = extra.providerId ?? cfg.providerId;
+      const threadId = extra.message_thread_id ?? cfg.providerThreads?.[provider] ?? cfg.threadId;
+      const params = {
         chat_id: cfg.chatId,
         text,
         ...(cfg.silent ? { disable_notification: true } : {}),
-        ...(cfg.threadId ? { message_thread_id: Number(cfg.threadId) } : {}),
+        ...(threadId != null && threadId !== '' ? { message_thread_id: Number(threadId) } : {}),
         ...extra,
-      }),
+      };
+      delete params.providerId;
+      try {
+        return await call('sendMessage', params);
+      } catch (err) {
+        if (String(err.message || '').includes('message_thread_id') && params.message_thread_id != null) {
+          delete params.message_thread_id;
+          return call('sendMessage', params);
+        }
+        throw err;
+      }
+    },
     // editMessageText KHÔNG kèm reply_markup ⇒ Telegram gỡ luôn bàn phím nút của tin đó,
     // nên tin đã chốt không thể bị bấm lại.
     editMessageText: (messageId, text) =>
@@ -271,7 +387,7 @@ export function firstUserSnippet(lines) {
 // Tóm tắt nhúng trong marker: <!-- CC_NOTIFY_DONE: ý 1 | ý 2 --> (dòng đầu tiên khớp).
 export function extractDoneSummary(text) {
   for (const line of text.split('\n')) {
-    const m = line.match(new RegExp(`.*${MARKER_DONE}:\\s*(.*\\S)\\s*-->.*`));
+    const m = line.match(new RegExp(`.*(?:${MARKER_DONE}|${AI_MARKER_DONE}):\\s*(.*\\S)\\s*-->.*`));
     if (m) return m[1];
   }
   return '';
@@ -288,7 +404,13 @@ export function summaryToBullets(summary) {
 export function fallbackBody(text) {
   let lines = text
     .split('\n')
-    .filter((l) => !l.includes(MARKER_DONE) && !l.includes(MARKER_ESCALATE))
+    .filter(
+      (l) =>
+        !l.includes(MARKER_DONE) &&
+        !l.includes(MARKER_ESCALATE) &&
+        !l.includes(AI_MARKER_DONE) &&
+        !l.includes(AI_MARKER_ESCALATE)
+    )
     .map((l) => l.replace(/<!--[^>]*-->/g, ''));
   let start = -1;
   let end = -1;
@@ -312,11 +434,12 @@ export function extractEscalateLine(text, str) {
 }
 
 // Quyết định nội dung gửi cho event stop; trả null nếu không có marker (không gửi gì).
-export function buildStopMessage({ last, project, snippet, str }) {
-  if (last.includes(MARKER_ESCALATE)) {
-    return `${extractEscalateLine(last, str)}\n${str.escalateSuffix(project)}`;
+export function buildStopMessage({ last, project, snippet, str, providerId }) {
+  const provider = providerId ? providerDisplayName(providerId) : undefined;
+  if (last.includes(MARKER_ESCALATE) || last.includes(AI_MARKER_ESCALATE)) {
+    return `${extractEscalateLine(last, str)}\n${str.escalateSuffix(project, provider)}`;
   }
-  if (!last.includes(MARKER_DONE)) return null;
+  if (!last.includes(MARKER_DONE) && !last.includes(AI_MARKER_DONE)) return null;
 
   const summary = extractDoneSummary(last);
   if (summary) return `✅ ${project}\n${summaryToBullets(summary)}`;
@@ -328,7 +451,15 @@ export function buildStopMessage({ last, project, snippet, str }) {
 }
 
 export function projectName(payload, env = process.env) {
-  return basename(env.CLAUDE_PROJECT_DIR || payload.cwd || '') || 'claude';
+  const workspace = Array.isArray(payload.workspacePaths) ? payload.workspacePaths[0] : '';
+  return basename(env.CLAUDE_PROJECT_DIR || payload.cwd || payload.cwdPath || workspace || '') || 'project';
+}
+
+export function buildTag({ providerId, project = 'project', suffix = '', sessionId = '' }) {
+  const tail = suffix || (sessionId ? String(sessionId).slice(-4) : '');
+  const parts = providerId ? [providerDisplayName(providerId), project] : [project];
+  if (tail) parts.push(tail);
+  return `[${parts.join(' · ')}]`;
 }
 
 async function runStop(payload, cfg, tg, env) {
@@ -341,10 +472,11 @@ async function runStop(payload, cfg, tg, env) {
     project: projectName(payload, env),
     snippet: firstUserSnippet(lines),
     str,
+    providerId: cfg.providerId,
   });
   // Quét pending mồ côi của session này (user Esc câu hỏi → PostToolUse không bắn).
   await sweepSessionPending(payload.session_id, cfg, tg).catch(() => {});
-  if (message) await tg.sendMessage(message);
+  if (message) await tg.sendMessage(message, { providerId: cfg.providerId });
 }
 
 // ---------------------------------------------------------------------------
@@ -368,9 +500,9 @@ function ensureStateDirs(home) {
 }
 
 // Full câu hỏi + FULL nhãn/mô tả mọi lựa chọn — KHÔNG cắt (chunkMessage lo phần dài).
-export function buildAskMessage(questions, { project, suffix, str }) {
-  const tag = suffix ? `[${project} · ${suffix}]` : `[${project}]`;
-  const out = [str.askHeader(tag), ''];
+export function buildAskMessage(questions, { project, suffix, str, providerId }) {
+  const tag = buildTag({ providerId, project, suffix });
+  const out = [str.askHeader(tag, providerId ? providerDisplayName(providerId) : undefined), ''];
   questions.forEach((q, qi) => {
     const multi = q.multiSelect ? ` ${str.askMulti}` : '';
     out.push(`${qi + 1}. ${q.question}${multi}`);
@@ -453,6 +585,14 @@ export function denyOutput(reason) {
       permissionDecisionReason: reason,
     },
   });
+}
+
+export function formatAskOutput(providerId, reason) {
+  const provider = normalizeProviderId(providerId);
+  if (provider === 'antigravity') return JSON.stringify({ decision: 'deny', reason });
+  // Codex CLI notifications do not expose a stable simple hook output contract for Ask.
+  // Keep Claude-compatible output as the safe default until a concrete app-server bridge is used.
+  return denyOutput(reason);
 }
 
 // Phân loại một update Telegram so với các câu hỏi đang chờ.
@@ -620,7 +760,7 @@ async function waitForReply({ tg, cfg, dir, ownMessageIds, deadline, env, home, 
     while (Date.now() < deadline) {
       // Tắt cờ giữa chừng (user về máy) → nhả về UI local trong vài giây.
       // Đọc lại config MỖI vòng nên `remote off` / `remote-perm off` có hiệu lực ngay.
-      const live = loadConfig({ env, home });
+      const live = loadConfig({ env, home, providerId: cfg.providerId });
       if (!live.remote || (mode === 'perm' && !live.remotePermission)) return { type: 'remote-off' };
 
       // 1) inbox của mình có sẵn kết quả (poller khác phân phát)? — vào bất kỳ chunk nào
@@ -691,7 +831,7 @@ async function waitForReply({ tg, cfg, dir, ownMessageIds, deadline, env, home, 
         } else if (verdict.kind === 'need-reply-hint' && Date.now() - lastHintAt > 60_000) {
           lastHintAt = Date.now();
           const askCount = pending.filter((p) => p.kind !== 'perm').length;
-          await tg.sendMessage(strings(cfg).replyHint(askCount)).catch(() => {});
+          await tg.sendMessage(strings(cfg).replyHint(askCount), { providerId: cfg.providerId }).catch(() => {});
         }
       }
     }
@@ -713,6 +853,7 @@ async function runAsk(payload, cfg, tg, env, home = homedir()) {
     project: projectName(payload, env),
     suffix: String(payload.session_id || '').slice(-4),
     str,
+    providerId: cfg.providerId,
   });
 
   // Câu hỏi dài → nhiều tin; tin CUỐI (có footer) là "neo" nhận các cập nhật trạng thái.
@@ -720,7 +861,7 @@ async function runAsk(payload, cfg, tg, env, home = homedir()) {
   for (const chunk of chunkMessage(text)) {
     let sent;
     try {
-      sent = await tg.sendMessage(chunk);
+      sent = await tg.sendMessage(chunk, { providerId: cfg.providerId });
     } catch {
       break; // lỗi giữa chừng → dùng các chunk đã gửi được
     }
@@ -746,7 +887,7 @@ async function runAsk(payload, cfg, tg, env, home = homedir()) {
     } catch {
       // đã bị GC
     }
-    return denyOutput(buildDenyReason(outcome.text, questions, str));
+    return formatAskOutput(cfg.providerId, buildDenyReason(outcome.text, questions, str));
   }
 
   // local / remote-off / timeout → giữ pending cho ask-done chốt sổ khi user bấm tại máy.
@@ -833,6 +974,19 @@ export function permOutput(behavior, { message } = {}) {
   return JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision } });
 }
 
+export function formatPermissionOutput(providerId, behavior, { message, session = false } = {}) {
+  const provider = normalizeProviderId(providerId);
+  if (provider === 'antigravity') {
+    if (behavior === 'allow') return JSON.stringify({ decision: 'allow' });
+    return JSON.stringify({ decision: 'deny', ...(message ? { reason: message } : {}) });
+  }
+  if (provider === 'codex') {
+    const decision = behavior === 'allow' ? (session ? 'acceptForSession' : 'accept') : 'decline';
+    return JSON.stringify({ decision, ...(message ? { reason: message } : {}) });
+  }
+  return permOutput(behavior, { message });
+}
+
 const capText = (value, max) => {
   const cps = Array.from(String(value));
   return cps.length > max ? cps.slice(0, max).join('') + '…' : cps.join('');
@@ -867,10 +1021,10 @@ export function describePermission(toolName, toolInput) {
   return out.filter((line) => line !== '' && line != null).join('\n');
 }
 
-export function buildPermMessage({ toolName, toolInput, project, suffix, str }) {
-  const tag = suffix ? `[${project} · ${suffix}]` : `[${project}]`;
+export function buildPermMessage({ toolName, toolInput, project, suffix, str, providerId }) {
+  const tag = buildTag({ providerId, project, suffix });
   const detail = describePermission(toolName, toolInput);
-  return [str.permHeader(tag), '', `🔧 ${toolName}`, detail || str.permNoDetail, '', str.permFooter].join('\n');
+  return [str.permHeader(tag, providerId ? providerDisplayName(providerId) : undefined), '', `🔧 ${toolName}`, detail || str.permNoDetail, '', str.permFooter].join('\n');
 }
 
 // callback_data giới hạn 64 byte của Telegram → prefix 1 ký tự + key 16 hex = 18 byte.
@@ -920,9 +1074,9 @@ const hhmm = (ts) => new Date(ts).toTimeString().slice(0, 5);
 const NOTIFY_ONLY_TOOLS = new Set(['ExitPlanMode']);
 
 // Tin báo gọn cho tool notify-only (không nút, nhả về máy để duyệt).
-export function buildPlanNotice({ project, suffix, str }) {
-  const tag = suffix ? `[${project} · ${suffix}]` : `[${project}]`;
-  return str.planNotice(tag);
+export function buildPlanNotice({ project, suffix, str, providerId }) {
+  const tag = buildTag({ providerId, project, suffix });
+  return str.planNotice(tag, providerId ? providerDisplayName(providerId) : undefined);
 }
 
 async function runPerm(payload, cfg, tg, env, home = homedir()) {
@@ -941,7 +1095,13 @@ async function runPerm(payload, cfg, tg, env, home = homedir()) {
   if (NOTIFY_ONLY_TOOLS.has(toolName)) {
     await tg
       .sendMessage(
-        buildPlanNotice({ project: projectName(payload, env), suffix: String(payload.session_id || '').slice(-4), str })
+        buildPlanNotice({
+          project: projectName(payload, env),
+          suffix: String(payload.session_id || '').slice(-4),
+          str,
+          providerId: cfg.providerId,
+        }),
+        { providerId: cfg.providerId }
       )
       .catch(() => {});
     return null;
@@ -951,7 +1111,7 @@ async function runPerm(payload, cfg, tg, env, home = homedir()) {
   gcStateDir(dir);
 
   // Đã bấm "cho phép tất cả" và còn hạn → duyệt thẳng, KHÔNG gửi tin (đây là cơ chế chống spam).
-  if (readSessionAllow(dir, payload.session_id)) return permOutput('allow');
+  if (readSessionAllow(dir, payload.session_id)) return formatPermissionOutput(cfg.providerId, 'allow');
 
   const key = pendingKey(payload.session_id, [{ question: `${toolName}:${JSON.stringify(payload.tool_input ?? null)}` }]);
   const chunks = chunkMessage(
@@ -961,6 +1121,7 @@ async function runPerm(payload, cfg, tg, env, home = homedir()) {
       project: projectName(payload, env),
       suffix: String(payload.session_id || '').slice(-4),
       str,
+      providerId: cfg.providerId,
     })
   );
 
@@ -973,7 +1134,9 @@ async function runPerm(payload, cfg, tg, env, home = homedir()) {
     try {
       const sent = await tg.sendMessage(
         chunks[i],
-        isAnchor ? { reply_markup: permKeyboard(key, str, cfg.sessionAllowTtlMin) } : {}
+        isAnchor
+          ? { reply_markup: permKeyboard(key, str, cfg.sessionAllowTtlMin), providerId: cfg.providerId }
+          : { providerId: cfg.providerId }
       );
       if (!sent?.message_id) throw new Error('no message_id');
       messageIds.push(sent.message_id);
@@ -1023,7 +1186,7 @@ async function runPerm(payload, cfg, tg, env, home = homedir()) {
     const who = outcome.fromName ? ` (${outcome.fromName})` : '';
     if (outcome.action === 'd') {
       await tg.editMessageText(anchorId, str.permDenied(who)).catch(() => {});
-      return permOutput('deny', { message: str.permDenyReason });
+      return formatPermissionOutput(cfg.providerId, 'deny', { message: str.permDenyReason });
     }
     if (outcome.action === 's') {
       const until = writeSessionAllow(dir, payload.session_id, cfg.sessionAllowTtlMin);
@@ -1031,7 +1194,7 @@ async function runPerm(payload, cfg, tg, env, home = homedir()) {
     } else {
       await tg.editMessageText(anchorId, str.permAllowed(who)).catch(() => {});
     }
-    return permOutput('allow');
+    return formatPermissionOutput(cfg.providerId, 'allow', { session: outcome.action === 's' });
   }
 
   // 'l' (để máy xử lý) / remote-off / timeout → im lặng ⇒ hộp thoại hiện tại máy.
@@ -1065,7 +1228,12 @@ async function runNotify(payload, cfg, tg, env) {
   const message = payload.message;
   if (!message || typeof message !== 'string') return;
   if (shouldSkipNotification(payload.notification_type, message, cfg)) return;
-  await tg.sendMessage(`${strings(cfg).notifyPrefix} [${projectName(payload, env)}] ${message}`);
+  const tag = buildTag({
+    providerId: cfg.providerId,
+    project: projectName(payload, env),
+    sessionId: payload.session_id,
+  });
+  await tg.sendMessage(`${strings(cfg).notifyPrefix} ${tag} ${message}`, { providerId: cfg.providerId });
 }
 
 // ---------------------------------------------------------------------------
@@ -1078,9 +1246,53 @@ async function readStdin() {
   return data;
 }
 
+function parseRuntimeArgs(args, env = process.env) {
+  if (PROVIDERS.includes(args[0])) {
+    return { providerId: args[0], event: args[1] || 'stop' };
+  }
+  return {
+    event: args[0] || 'stop',
+    providerId: normalizeProviderId(args[1] || env.AI_NOTIFY_PROVIDER || env.CC_NOTIFY_PROVIDER || 'claude'),
+  };
+}
+
+function normalizeRuntimePayload(raw, providerId, event, env = process.env) {
+  const provider = normalizeProviderId(raw.provider || raw.providerId || providerId);
+  const toolCall = raw.toolCall || {};
+  const toolArgs = toolCall.args || raw.tool_input || raw.toolInput || {};
+  const questions = Array.isArray(toolArgs.questions)
+    ? toolArgs.questions.map((q) => ({
+        ...q,
+        multiSelect: q.multiSelect ?? q.is_multi_select,
+      }))
+    : raw.questions;
+  const command = raw.command || raw.item?.command || raw.commandActions?.[0]?.command;
+  const sessionId = raw.session_id || raw.sessionId || raw.conversationId || raw.threadId || raw.turnId || '';
+  return {
+    ...raw,
+    provider,
+    session_id: sessionId,
+    transcript_path: raw.transcript_path || raw.transcriptPath,
+    cwd: raw.cwd || raw.cwdPath || raw.workspacePaths?.[0] || process.cwd(),
+    tool_name: raw.tool_name || raw.toolName || toolCall.name || (command ? 'Command' : undefined),
+    tool_input: {
+      ...(command ? { command, cwd: raw.cwd, reason: raw.reason } : {}),
+      ...toolArgs,
+      ...(questions ? { questions } : {}),
+    },
+    tool_response: raw.tool_response || raw.toolResponse,
+    message: raw.message || raw.reason || raw.notification?.message,
+    notification_type: raw.notification_type || raw.notificationType,
+    _normalizedProvider: provider,
+    _normalizedEvent: event,
+    _project: projectName(raw, env),
+  };
+}
+
 async function main() {
   const args = process.argv.slice(2);
-  const cfg = loadConfig();
+  const parsed = parseRuntimeArgs(args);
+  let cfg = loadConfig({ providerId: parsed.providerId });
 
   if (args.includes('--test')) {
     if (hasCredentials(cfg)) await makeTelegram(cfg).sendMessage(strings(cfg).testMessage);
@@ -1088,20 +1300,23 @@ async function main() {
   }
   if (!hasCredentials(cfg)) return null;
 
-  const event = args[0] || 'stop';
   let payload = {};
   try {
     payload = JSON.parse(await readStdin());
   } catch {
     return null;
   }
+  const providerId = normalizeProviderId(payload.provider || payload.providerId || parsed.providerId);
+  cfg = loadConfig({ providerId });
+  cfg.providerId = providerId;
+  payload = normalizeRuntimePayload(payload, providerId, parsed.event, process.env);
   const tg = makeTelegram(cfg);
 
-  if (event === 'stop') return runStop(payload, cfg, tg, process.env).then(() => null);
-  if (event === 'ask') return runAsk(payload, cfg, tg, process.env);
-  if (event === 'ask-done') return runAskDone(payload, cfg, tg).then(() => null);
-  if (event === 'notify') return runNotify(payload, cfg, tg, process.env).then(() => null);
-  if (event === 'perm') return runPerm(payload, cfg, tg, process.env);
+  if (parsed.event === 'stop') return runStop(payload, cfg, tg, process.env).then(() => null);
+  if (parsed.event === 'ask') return runAsk(payload, cfg, tg, process.env);
+  if (parsed.event === 'ask-done') return runAskDone(payload, cfg, tg).then(() => null);
+  if (parsed.event === 'notify') return runNotify(payload, cfg, tg, process.env).then(() => null);
+  if (parsed.event === 'perm') return runPerm(payload, cfg, tg, process.env);
   return null;
 }
 
