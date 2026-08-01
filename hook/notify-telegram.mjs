@@ -871,36 +871,27 @@ async function waitForReply({ tg, cfg, dir, ownMessageIds, deadline, env, home, 
   }
 }
 
-async function runAsk(payload, cfg, tg, env, home = homedir()) {
-  if (!cfg.remote) return null;
-  const questions = payload.tool_input?.questions;
-  if (!Array.isArray(questions) || questions.length === 0) return null;
+export async function promptTelegramAsk({ payload, cfg, tg, env, home = homedir(), questions, text }) {
+  if (!cfg.remote) return { type: 'remote-off' };
+  if (!Array.isArray(questions) || questions.length === 0) return { type: 'invalid' };
 
   const dir = ensureStateDirs(home);
   gcStateDir(dir);
-  const str = strings(cfg);
-  const text = buildAskMessage(questions, {
-    project: projectName(payload, env),
-    suffix: String(payload.session_id || '').slice(-4),
-    str,
-    providerId: cfg.providerId,
-  });
 
-  // Câu hỏi dài → nhiều tin; tin CUỐI (có footer) là "neo" nhận các cập nhật trạng thái.
   const messageIds = [];
   for (const chunk of chunkMessage(text)) {
     let sent;
     try {
       sent = await tg.sendMessage(chunk, { providerId: cfg.providerId });
     } catch {
-      break; // lỗi giữa chừng → dùng các chunk đã gửi được
+      break;
     }
     if (!sent?.message_id) break;
     messageIds.push(sent.message_id);
   }
-  if (!messageIds.length) return null; // không gửi được gì → UI local như thường
-  const anchorId = messageIds[messageIds.length - 1];
+  if (!messageIds.length) return { type: 'send-failed' };
 
+  const anchorId = messageIds[messageIds.length - 1];
   const key = pendingKey(payload.session_id, questions);
   writeFileSync(
     pendingPath(dir, key),
@@ -909,6 +900,25 @@ async function runAsk(payload, cfg, tg, env, home = homedir()) {
 
   const deadline = Date.now() + cfg.remoteAskTimeoutSec * 1000;
   const outcome = await waitForReply({ tg, cfg, dir, ownMessageIds: messageIds, deadline, env, home });
+  return { type: 'ok', outcome, anchorId, key, dir, pendingFile: pendingPath(dir, key) };
+}
+
+async function runAsk(payload, cfg, tg, env, home = homedir()) {
+  if (!cfg.remote) return null;
+  const questions = payload.tool_input?.questions;
+  if (!Array.isArray(questions) || questions.length === 0) return null;
+
+  const str = strings(cfg);
+  const text = buildAskMessage(questions, {
+    project: projectName(payload, env),
+    suffix: String(payload.session_id || '').slice(-4),
+    str,
+    providerId: cfg.providerId,
+  });
+
+  const prompt = await promptTelegramAsk({ payload, cfg, tg, env, home, questions, text });
+  if (prompt.type !== 'ok') return null;
+  const { outcome, anchorId, key, dir } = prompt;
 
   if (outcome.type === 'reply' && !isLocalKeyword(outcome.text)) {
     await tg.editMessageText(anchorId, str.answeredTg(outcome.text)).catch(() => {});
