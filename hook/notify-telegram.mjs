@@ -477,18 +477,33 @@ export function buildTag({ providerId, project = 'project', suffix = '', session
   return `[${parts.join(' · ')}]`;
 }
 
+function buildTurnCompleteMessage({ last, project, snippet, str, providerId, sessionId }) {
+  const markerMessage = buildStopMessage({ last, project, snippet, str, providerId });
+  if (markerMessage) return markerMessage;
+
+  const tag = buildTag({ providerId, project, sessionId });
+  const body = fallbackBody(last || '') || (snippet ? `"${snippet}"\n${str.doneFallback}` : str.donePlain);
+  return `✅ ${tag}\n${body}`;
+}
+
 async function runStop(payload, cfg, tg, env) {
   const transcript = payload.transcript_path;
-  if (!transcript || !existsSync(transcript)) return;
-  const lines = readFileSync(transcript, 'utf8').split('\n').filter(Boolean);
+  const hasTranscript = transcript && existsSync(transcript);
+  const lines = hasTranscript ? readFileSync(transcript, 'utf8').split('\n').filter(Boolean) : [];
   const str = strings(cfg);
-  const message = buildStopMessage({
-    last: lastAssistantText(lines),
-    project: projectName(payload, env),
-    snippet: firstUserSnippet(lines),
-    str,
-    providerId: cfg.providerId,
-  });
+  const last = payload.last_assistant_message || payload.lastAssistantMessage || lastAssistantText(lines);
+  const snippet = firstUserSnippet(lines);
+  const project = projectName(payload, env);
+  const message =
+    cfg.providerId === 'codex'
+      ? buildTurnCompleteMessage({ last, project, snippet, str, providerId: cfg.providerId, sessionId: payload.session_id })
+      : buildStopMessage({
+          last,
+          project,
+          snippet,
+          str,
+          providerId: cfg.providerId,
+        });
   // Quét pending mồ côi của session này (user Esc câu hỏi → PostToolUse không bắn).
   await sweepSessionPending(payload.session_id, cfg, tg).catch(() => {});
   if (message) await tg.sendMessage(message, { providerId: cfg.providerId });
@@ -996,8 +1011,7 @@ export function formatPermissionOutput(providerId, behavior, { message, session 
     return JSON.stringify({ decision: 'deny', ...(message ? { reason: message } : {}) });
   }
   if (provider === 'codex') {
-    const decision = behavior === 'allow' ? (session ? 'acceptForSession' : 'accept') : 'decline';
-    return JSON.stringify({ decision, ...(message ? { reason: message } : {}) });
+    return permOutput(behavior, { message });
   }
   return permOutput(behavior, { message });
 }
@@ -1240,6 +1254,17 @@ export function shouldSkipNotification(notificationType, message, cfg) {
 
 async function runNotify(payload, cfg, tg, env) {
   if (!cfg.remote) return;
+  if (cfg.providerId === 'codex' && payload.type === 'agent-turn-complete') {
+    const project = projectName(payload, env);
+    const tag = buildTag({ providerId: cfg.providerId, project, sessionId: payload.session_id });
+    const body =
+      fallbackBody(payload.last_assistant_message || '') ||
+      (Array.isArray(payload.input_messages) && payload.input_messages.length
+        ? `"${payload.input_messages.join(' ').slice(0, 120)}"\n${strings(cfg).doneFallback}`
+        : strings(cfg).donePlain);
+    await tg.sendMessage(`✅ ${tag}\n${body}`, { providerId: cfg.providerId });
+    return;
+  }
   const message = payload.message;
   if (!message || typeof message !== 'string') return;
   if (shouldSkipNotification(payload.notification_type, message, cfg)) return;
@@ -1287,6 +1312,7 @@ function normalizeRuntimePayload(raw, providerId, event, env = process.env) {
     ...raw,
     provider,
     session_id: sessionId,
+    turn_id: raw.turn_id || raw.turnId || raw['turn-id'],
     transcript_path: raw.transcript_path || raw.transcriptPath,
     cwd: raw.cwd || raw.cwdPath || raw.workspacePaths?.[0] || process.cwd(),
     tool_name: raw.tool_name || raw.toolName || toolCall.name || (command ? 'Command' : undefined),
@@ -1298,6 +1324,9 @@ function normalizeRuntimePayload(raw, providerId, event, env = process.env) {
     tool_response: raw.tool_response || raw.toolResponse,
     message: raw.message || raw.reason || raw.notification?.message,
     notification_type: raw.notification_type || raw.notificationType,
+    type: raw.type,
+    input_messages: raw.input_messages || raw.inputMessages || raw['input-messages'],
+    last_assistant_message: raw.last_assistant_message || raw.lastAssistantMessage || raw['last-assistant-message'],
     _normalizedProvider: provider,
     _normalizedEvent: event,
     _project: projectName(raw, env),
@@ -1316,8 +1345,10 @@ async function main() {
   if (!hasCredentials(cfg)) return null;
 
   let payload = {};
+  const stdin = await readStdin();
+  const argvPayload = args.find((arg, index) => index > 1 && String(arg).trim().startsWith('{'));
   try {
-    payload = JSON.parse(await readStdin());
+    payload = JSON.parse(stdin || argvPayload || '{}');
   } catch {
     return null;
   }
