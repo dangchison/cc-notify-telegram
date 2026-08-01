@@ -41,12 +41,15 @@ test('CodexProvider: normalize command approval payload và format app-server de
   assert.equal(payload.sessionId, 'thread-1');
   assert.equal(payload.toolName, 'Command');
   assert.deepEqual(payload.toolInput, { command: 'npm test', cwd: '/repo/app', reason: 'verify' });
-  assert.equal(JSON.parse(provider.formatOutput({ behavior: 'allow' }, 'perm')).decision, 'accept');
-  assert.equal(JSON.parse(provider.formatOutput({ behavior: 'allow', session: true }, 'perm')).decision, 'acceptForSession');
-  assert.equal(JSON.parse(provider.formatOutput({ behavior: 'deny', reason: 'no' }, 'perm')).decision, 'decline');
+  assert.deepEqual(JSON.parse(provider.formatOutput({ behavior: 'allow' }, 'perm')), {
+    hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } },
+  });
+  assert.deepEqual(JSON.parse(provider.formatOutput({ behavior: 'deny', reason: 'no' }, 'perm')), {
+    hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny', message: 'no' } },
+  });
 });
 
-test('CodexProvider: registerHooks ghi notify ở TOML root trước các table', async () => {
+test('CodexProvider: registerHooks ghi lifecycle hooks vào hooks.json', async () => {
   const home = mkdtempSync(join(tmpdir(), 'cc-notify-codex-'));
   const codexDir = join(home, '.codex');
   mkdirSync(codexDir, { recursive: true });
@@ -56,28 +59,59 @@ test('CodexProvider: registerHooks ghi notify ở TOML root trước các table'
   const provider = new CodexProvider();
   await provider.registerHooks({ nodePath: '/usr/bin/node', hookPath: '/tmp/hook.mjs', home });
 
-  const config = readFileSync(configFile, 'utf8');
-  const markerIndex = config.indexOf('# ai-notify-telegram notify');
-  const tableIndex = config.indexOf('[tui.model_availability_nux]');
-  assert.ok(markerIndex >= 0);
-  assert.ok(markerIndex < tableIndex);
-  assert.doesNotMatch(config.slice(tableIndex), /^notify\s*=/m);
+  const hooks = JSON.parse(readFileSync(join(codexDir, 'hooks.json'), 'utf8'));
+  assert.match(hooks.hooks.Stop[0].hooks[0].command, /"\/usr\/bin\/node" "\/tmp\/hook\.mjs" stop codex/);
+  assert.match(hooks.hooks.PermissionRequest[0].hooks[0].command, /"\/usr\/bin\/node" "\/tmp\/hook\.mjs" perm codex/);
+  assert.equal(hooks.hooks.PermissionRequest[0].matcher, '*');
+  assert.equal(readFileSync(configFile, 'utf8'), 'model = "gpt-5"\n\n[tui.model_availability_nux]\n"gpt-5.6-sol" = 1\n');
 });
 
-test('CodexProvider: registerHooks thay notify root hiện có thay vì tạo duplicate', async () => {
+test('CodexProvider: registerHooks migrate owned notify block without touching user notify', async () => {
   const home = mkdtempSync(join(tmpdir(), 'cc-notify-codex-'));
   const codexDir = join(home, '.codex');
   mkdirSync(codexDir, { recursive: true });
   const configFile = join(codexDir, 'config.toml');
-  writeFileSync(configFile, 'model = "gpt-5"\nnotify = ["/old"]\n\n[plugins.demo]\nenabled = true\n');
+  writeFileSync(
+    configFile,
+    [
+      'model = "gpt-5"',
+      '# ai-notify-telegram notify',
+      'notify = ["/old-owned"]',
+      'notify = ["/user-owned"]',
+      '',
+      '[plugins.demo]',
+      'enabled = true',
+      '',
+    ].join('\n')
+  );
 
   const provider = new CodexProvider();
   await provider.registerHooks({ nodePath: '/usr/bin/node', hookPath: '/tmp/hook.mjs', home });
 
   const config = readFileSync(configFile, 'utf8');
   assert.equal(config.match(/^notify\s*=/gm)?.length, 1);
-  assert.doesNotMatch(config, /"\/old"/);
-  assert.match(config, /^notify = \["\/usr\/bin\/node", "\/tmp\/hook\.mjs", "notify", "codex"\]$/m);
+  assert.doesNotMatch(config, /"\/old-owned"/);
+  assert.match(config, /"\/user-owned"/);
+});
+
+test('CodexProvider: unregisterHooks removes only owned lifecycle hooks', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'cc-notify-codex-'));
+  const codexDir = join(home, '.codex');
+  mkdirSync(codexDir, { recursive: true });
+
+  const provider = new CodexProvider();
+  await provider.registerHooks({ nodePath: '/usr/bin/node', hookPath: '/tmp/hook.mjs', home });
+  const hooksFile = join(codexDir, 'hooks.json');
+  const hooks = JSON.parse(readFileSync(hooksFile, 'utf8'));
+  hooks.hooks.Stop.push({ hooks: [{ type: 'command', command: 'python3 /tmp/user-stop.py' }] });
+  writeFileSync(hooksFile, JSON.stringify(hooks, null, 2) + '\n');
+
+  await provider.unregisterHooks({ home });
+
+  const next = JSON.parse(readFileSync(hooksFile, 'utf8'));
+  assert.equal(next.hooks.Stop.length, 1);
+  assert.equal(next.hooks.Stop[0].hooks[0].command, 'python3 /tmp/user-stop.py');
+  assert.equal(next.hooks.PermissionRequest, undefined);
 });
 
 test('AntigravityProvider: normalize hook payload và format PreToolUse decisions', () => {
