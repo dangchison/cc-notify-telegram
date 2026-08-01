@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// CLI cc-notify-telegram: init (mặc định) | test | status | remote on|off | uninstall
+// CLI cc-notify-telegram: init (mặc định) | test | status | remote on|off [provider] | uninstall
 
 import { realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -11,7 +11,7 @@ import { runRemote } from '../src/remote.mjs';
 import { runStatus } from '../src/status.mjs';
 import { runUninstall } from '../src/uninstall.mjs';
 
-const VALUE_FLAGS = new Set(['token', 'chat-id', 'thread-id', 'lang', 'allow-user']);
+const VALUE_FLAGS = new Set(['token', 'chat-id', 'thread-id', 'lang', 'allow-user', 'providers', 'provider']);
 
 // Cờ được phép lặp lại (--allow-user 1 --allow-user 2) → gom thành mảng thay vì ghi đè.
 const REPEATABLE_FLAGS = new Set(['allow-user']);
@@ -46,7 +46,7 @@ export function parseArgs(argv) {
   return flags;
 }
 
-const HELP = `cc-notify-telegram — Claude Code ↔ Telegram
+const HELP = `cc-notify-telegram — AI agents ↔ Telegram
 
 Cách dùng:
   npx cc-notify-telegram [init]     Wizard cài đặt (token, chat ID, hooks, CLAUDE.md)
@@ -54,14 +54,20 @@ Cách dùng:
   npx cc-notify-telegram status     Kiểm tra sức khoẻ toàn chuỗi notify
   npx cc-notify-telegram remote on  Bật Remote Ask (trả lời câu hỏi của Claude qua Telegram)
   npx cc-notify-telegram remote off Tắt Remote Ask (câu hỏi hiện tại máy)
+  npx cc-notify-telegram remote on codex
+                                    Bật Remote Ask riêng cho provider
   npx cc-notify-telegram remote-perm on|off
                                     Bật/tắt Remote Permission (duyệt hộp thoại quyền bằng
                                     nút bấm Telegram — chỉ allowedUserIds mới bấm được)
+  npx cc-notify-telegram remote-perm on antigravity
+                                    Bật/tắt Remote Permission riêng cho provider
   npx cc-notify-telegram uninstall  Gỡ hooks (--purge: xoá cả config/token + CLAUDE.md block)
 
 Cờ cho init (non-interactive):
   --token <bot-token> --chat-id <id> [--thread-id <n>] [--lang vi|en]
-  [--silent] [--yes] [--no-test] [--no-claude-md] [--remove-legacy|--keep-legacy]
+  [--providers claude,codex,antigravity]
+  [--silent] [--yes] [--no-test] [--no-claude-md] [--no-agent-md]
+  [--remove-legacy|--keep-legacy]
   [--allow-user <telegram-user-id>]  (lặp lại được; bật luôn Remote Permission)
 `;
 
@@ -94,9 +100,9 @@ async function main() {
     case 'status':
       return runStatus({});
     case 'remote':
-      return runRemote(flags._[1], {});
+      return runRemote(flags._[1], { provider: flags._[2] });
     case 'remote-perm':
-      return runRemote(flags._[1], { key: 'remotePermission' });
+      return runRemote(flags._[1], { key: 'remotePermission', provider: flags._[2] });
     case 'uninstall':
       return runUninstall(flags);
     default:

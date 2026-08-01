@@ -6,14 +6,15 @@
 
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 
 import { loadConfig, makeTelegram } from '../hook/notify-telegram.mjs';
-import { readConfig, readLegacyConf, writeConfig } from './config.mjs';
+import { PROVIDERS, readConfig, readLegacyConf, writeConfig } from './config.mjs';
 import { findLegacyStopEntries, isInstalled, mergeSettings } from './settings.mjs';
 import { hasBlock, upsertBlock } from './snippet.mjs';
+import { ProviderRegistry } from './providers/index.mjs';
 
 const HOOK_SOURCE = fileURLToPath(new URL('../hook/notify-telegram.mjs', import.meta.url));
 
@@ -189,16 +190,36 @@ export async function runInit(flags, { home = homedir(), log = console.log } = {
       }
     }
 
+    const selectedProviders = String(flags.providers || flags.provider || 'claude')
+      .split(',')
+      .map((s) => s.trim())
+      .filter((id) => PROVIDERS.includes(id));
+    const enabledProviders = [
+      ...new Set(['claude', ...(existing.enabledProviders || []), ...(selectedProviders.length ? selectedProviders : [])]),
+    ];
+    const remote = existing.remote && typeof existing.remote === 'object'
+      ? existing.remote
+      : { global: existing.remote === true, providers: { claude: existing.remote === true } };
+    const remotePermissionConfig = existing.remotePermission && typeof existing.remotePermission === 'object'
+      ? existing.remotePermission
+      : { global: existing.remotePermission === true || remotePermission, providers: { claude: existing.remotePermission === true || remotePermission } };
+    if (remotePermission) {
+      remotePermissionConfig.global = true;
+      remotePermissionConfig.providers = { ...(remotePermissionConfig.providers || {}), claude: true };
+    }
     const config = {
+      version: 1,
       botToken,
       chatId,
       ...(flags['thread-id'] ? { threadId: Number(flags['thread-id']) } : existing.threadId ? { threadId: existing.threadId } : {}),
+      providerThreads: existing.providerThreads || {},
+      enabledProviders,
       lang: flags.lang === 'en' ? 'en' : existing.lang === 'en' && !flags.lang ? 'en' : 'vi',
       ...(flags.silent || existing.silent ? { silent: true } : {}),
-      ...(existing.remote ? { remote: true } : {}),
+      remote,
       ...(existing.remoteAskTimeoutSec ? { remoteAskTimeoutSec: existing.remoteAskTimeoutSec } : {}),
       ...(allowedUserIds.length ? { allowedUserIds } : {}),
-      ...(remotePermission ? { remotePermission: true } : {}),
+      remotePermission: remotePermissionConfig,
       ...(existing.sessionAllowTtlMin ? { sessionAllowTtlMin: existing.sessionAllowTtlMin } : {}),
     };
     const configFile = writeConfig(config, home);
@@ -233,6 +254,16 @@ export async function runInit(flags, { home = homedir(), log = console.log } = {
       log('✅ settings.json đã đúng — không cần sửa.');
     }
 
+    const registry = new ProviderRegistry();
+    for (const providerId of enabledProviders.filter((id) => id !== 'claude')) {
+      try {
+        const result = await registry.get(providerId).registerHooks({ nodePath, hookPath: paths.hookFile, home });
+        log(`✅ ${registry.get(providerId).displayName}: ${result.updatedFiles.join(', ')}`);
+      } catch (err) {
+        log(`⚠️  Không đăng ký được ${providerId}: ${err.message}`);
+      }
+    }
+
     // ── 4. Snippet CLAUDE.md (giao thức marker — không có nó Claude không phát marker) ─
     if (!flags['no-claude-md']) {
       let consent = true;
@@ -251,6 +282,26 @@ export async function runInit(flags, { home = homedir(), log = console.log } = {
       } else {
         log('⏭  Bỏ qua CLAUDE.md — tự thêm sau bằng nội dung trong snippets/ nếu muốn nhận notify.');
       }
+    }
+
+    const snippetMap = {
+      codex: 'codex-md',
+      antigravity: 'agents-md',
+    };
+    for (const providerId of enabledProviders.filter((id) => id !== 'claude')) {
+      if (flags['no-agent-md']) continue;
+      const provider = registry.get(providerId);
+      const snippetName = snippetMap[providerId];
+      if (!snippetName) continue;
+      const snippet = readFileSync(
+        fileURLToPath(new URL(`../snippets/${snippetName}.${config.lang}.md`, import.meta.url)),
+        'utf8'
+      );
+      const file = provider.paths(home).instructionFile;
+      mkdirSync(dirname(file), { recursive: true });
+      const current = existsSync(file) ? readFileSync(file, 'utf8') : '';
+      writeFileSync(file, upsertBlock(current, snippet));
+      log(`✅ Snippet marker → ${file}`);
     }
 
     // ── 5. Tin test ───────────────────────────────────────────────────────────

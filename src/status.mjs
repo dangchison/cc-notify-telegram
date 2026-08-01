@@ -3,11 +3,12 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 
-import { loadConfig, makeTelegram, hasCredentials } from '../hook/notify-telegram.mjs';
+import { isRemoteEnabled, isRemotePermEnabled, loadConfig, makeTelegram, hasCredentials } from '../hook/notify-telegram.mjs';
 import { configPath } from './config.mjs';
 import { HOOK_ENTRIES } from './settings.mjs';
 import { hasBlock } from './snippet.mjs';
 import { installPaths } from './init.mjs';
+import { ProviderRegistry } from './providers/index.mjs';
 
 function extractNodePath(command) {
   const m = /^"([^"]+)"/.exec(command || '');
@@ -17,6 +18,7 @@ function extractNodePath(command) {
 export async function runStatus({ home = homedir(), log = console.log } = {}) {
   const paths = installPaths(home);
   const cfg = loadConfig({ home });
+  const registry = new ProviderRegistry();
   const rows = [];
   const add = (ok, label, fix = '') => rows.push({ ok, label, fix });
 
@@ -75,8 +77,21 @@ export async function runStatus({ home = homedir(), log = console.log } = {}) {
     'không có → Claude không phát marker, không có notify; chạy lại init'
   );
 
+  log('📊 Multi-Provider Status Matrix:');
+  log('─────────────────────────────────────────────────────────────');
+  for (const provider of registry.getAll()) {
+    const status = await provider.isInstalled({ home });
+    const remoteAsk = isRemoteEnabled(cfg, provider.id) ? 'ON' : 'off';
+    const remotePerm = isRemotePermEnabled(cfg, provider.id) ? 'ON' : 'off';
+    const enabled = cfg.enabledProviders.includes(provider.id) ? 'enabled' : 'disabled';
+    const symbol = status.installed ? '✓' : '✗';
+    log(`${symbol} ${provider.displayName.padEnd(14)} | ${enabled.padEnd(8)} | Hooks: ${status.installed ? 'OK' : 'MISSING'} | Remote Ask: ${remoteAsk} | Remote Perm: ${remotePerm}`);
+  }
+  log('─────────────────────────────────────────────────────────────');
+  log('');
+
   // Remote mode
-  add(true, `Remote Ask: ${cfg.remote ? `ON (chờ tối đa ${cfg.remoteAskTimeoutSec}s)` : 'off'}`);
+  add(true, `Remote Ask (Claude effective): ${cfg.remote ? `ON (chờ tối đa ${cfg.remoteAskTimeoutSec}s)` : 'off'}`);
 
   // Remote Permission — bật mà thiếu điều kiện thì hook im lặng (fail-closed), phải nói rõ.
   if (!cfg.remotePermission) {
